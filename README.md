@@ -55,9 +55,6 @@ docker run -p 3000:3000 nexus-rtc
 
 Open **http://localhost:3000**.
 
-## Deploy
-
-See **[DEPLOYMENT.md](DEPLOYMENT.md)** for VPS (Docker + Nginx), Railway, Render, Fly.io, and production checklist (HTTPS, WebSockets).
 
 ## Project layout
 
