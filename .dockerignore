@@ -1,0 +1,36 @@
+# Dependencies and build output (rebuilt in container)
+node_modules
+.next
+
+# Git
+.git
+.gitignore
+
+# IDE / editor
+.cursor
+.vscode
+*.swp
+*.swo
+
+# Logs and env
+*.log
+.env
+.env.*
+.env.local
+.env.*.local
+
+# Docs (optional)
+docs
+*.md
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose*.yml
+.docker
+
+# Misc
+.DS_Store
+npm-debug.log*
+.npm
+.cache

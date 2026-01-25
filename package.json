@@ -1,0 +1,25 @@
+{
+  "name": "nexus-rtc",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js",
+    "clean": "rm -rf .next",
+    "reinstall": "rm -rf .next node_modules package-lock.json && npm install --legacy-peer-deps",
+    "build": "next build",
+    "start": "NODE_ENV=production node server.js",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "14.2.18",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "typescript": "^5"
+  }
+}

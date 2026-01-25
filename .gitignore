@@ -1,0 +1,31 @@
+# Dependencies
+node_modules
+
+# Build
+.next
+out
+
+# Env
+.env
+.env.*
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# IDE
+.idea
+.vscode
+.cursor
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+.vercel
+.cache
