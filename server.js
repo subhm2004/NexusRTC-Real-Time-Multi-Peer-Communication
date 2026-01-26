@@ -67,26 +67,59 @@ app.prepare().then(() => {
     if (type === "room") {
       const room = getOrCreateRoom(id);
       const peerId = crypto.randomUUID();
-      room.peers.set(peerId, { ws, isViewer: false });
+      let peerName = null; // Will be set when client sends name
+      let nameReceived = false;
+      room.peers.set(peerId, { ws, name: peerName, isViewer: false });
+
+      // Function to notify existing peers about new peer (called after name is received)
+      const notifyNewPeer = (name) => {
+        room.peers.forEach((p, pid) => {
+          if (pid !== peerId && p.ws.readyState === 1) {
+            p.ws.send(JSON.stringify({ event: "new-peer", peerId, name: name, viewer: false }));
+          }
+        });
+      };
 
       ws.send(
         JSON.stringify({
           event: "joined",
           peerId,
-          peers: Array.from(room.peers.keys()).filter((k) => k !== peerId),
+          peers: Array.from(room.peers.entries())
+            .filter(([k]) => k !== peerId)
+            .map(([pid, p]) => ({ id: pid, name: p.name || `Peer ${pid.slice(0, 4)}` })),
           viewer: false,
         })
       );
-      room.peers.forEach((p, pid) => {
-        if (pid !== peerId && p.ws.readyState === 1) {
-          p.ws.send(JSON.stringify({ event: "new-peer", peerId, viewer: false }));
-        }
-      });
 
       ws.on("message", (raw) => {
         try {
           const msg = JSON.parse(raw.toString());
-          const { to, event, data } = msg;
+          const { to, event, data, name } = msg;
+          
+          // Handle name update - this should be the FIRST message sent
+          if (event === "set-name" && typeof name === "string" && name.trim()) {
+            const trimmedName = name.trim().slice(0, 30);
+            const peer = room.peers.get(peerId);
+            if (peer) {
+              peer.name = trimmedName;
+              peerName = trimmedName;
+              
+              // If this is the first time we're receiving the name, notify existing peers about new peer
+              if (!nameReceived) {
+                nameReceived = true;
+                notifyNewPeer(trimmedName);
+              } else {
+                // Name was updated, notify all peers
+                room.peers.forEach((p, pid) => {
+                  if (p.ws.readyState === 1) {
+                    p.ws.send(JSON.stringify({ event: "peer-name-updated", peerId, name: trimmedName }));
+                  }
+                });
+              }
+            }
+            return;
+          }
+          
           if (to && (event === "offer" || event === "answer" || event === "candidate")) {
             sendToPeer(room, to, { event, from: peerId, data });
           }
@@ -112,7 +145,19 @@ app.prepare().then(() => {
       }
       room.hub.clients.add(ws);
       ws.on("message", (raw) => {
-        broadcastChat(room.hub, raw.toString());
+        try {
+          const msg = JSON.parse(raw.toString());
+          // Handle typing and image messages
+          if (msg.type === "typing" || msg.type === "image") {
+            broadcastChat(room.hub, raw.toString());
+          } else {
+            // Regular chat message
+            broadcastChat(room.hub, raw.toString());
+          }
+        } catch {
+          // Fallback for plain text
+          broadcastChat(room.hub, raw.toString());
+        }
       });
       ws.on("close", () => {
         room.hub.clients.delete(ws);

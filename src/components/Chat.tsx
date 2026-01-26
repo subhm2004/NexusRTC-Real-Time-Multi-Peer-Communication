@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 const CHAT_NAME_KEY = "nexus-chat-name";
+const TYPING_TIMEOUT = 3000; // 3 seconds
+const TYPING_DEBOUNCE = 500; // 500ms debounce
 
 function currentTime() {
   const d = new Date();
@@ -20,15 +22,22 @@ function getOrCreateUserName(): string {
   return name;
 }
 
-function parseChatMessage(raw: string): string {
+function parseChatMessage(raw: string): { type: "message" | "typing" | "image"; name?: string; text?: string; image?: string } | null {
   try {
     const d = JSON.parse(raw);
-    if (d && typeof d.n === "string" && typeof d.m === "string")
-      return `${currentTime()} - ${d.n}: ${d.m}`;
+    if (d.type === "typing" && typeof d.n === "string") {
+      return { type: "typing", name: d.n };
+    }
+    if (d.type === "image" && typeof d.n === "string" && typeof d.url === "string") {
+      return { type: "image", name: d.n, image: d.url };
+    }
+    if (d && typeof d.n === "string" && typeof d.m === "string") {
+      return { type: "message", name: d.n, text: d.m };
+    }
   } catch {
     // backward compat: plain text
   }
-  return `${currentTime()} - Unknown: ${raw}`;
+  return null;
 }
 
 export function Chat({ wsUrl }: { wsUrl: string }) {
@@ -36,12 +45,16 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
   const [editingName, setEditingName] = useState(false);
   const [nameInput, setNameInput] = useState("");
   const [open, setOpen] = useState(false);
-  const [logs, setLogs] = useState<string[]>([]);
+  const [logs, setLogs] = useState<Array<{ type: "message" | "typing" | "image"; name?: string; text?: string; image?: string; time?: string }>>([]);
   const [hasNew, setHasNew] = useState(false);
   const [ready, setReady] = useState(false);
+  const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set());
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const typingDebounceRef = useRef<NodeJS.Timeout | null>(null);
   const openRef = useRef(open);
   const userNameInit = useRef(false);
   openRef.current = open;
@@ -69,10 +82,83 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
     };
     ws.onopen = () => setReady(true);
     ws.onmessage = (e) => {
-      const t = parseChatMessage(e.data as string);
-      setLogs((prev) => [...prev, t]);
-      if (!openRef.current) setHasNew(true);
-      setTimeout(() => logEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+      const raw = e.data as string;
+      
+      try {
+        const d = JSON.parse(raw);
+        
+        // Handle typing messages separately
+        if (d && d.type === "typing" && typeof d.n === "string") {
+          if (d.n !== userName) {
+            setTypingUsers((prev) => {
+              const next = new Set(prev);
+              next.add(d.n);
+              return next;
+            });
+            setTimeout(() => {
+              setTypingUsers((p) => {
+                const n = new Set(p);
+                n.delete(d.n);
+                return n;
+              });
+            }, TYPING_TIMEOUT);
+          }
+          return; // Don't add typing messages to chat logs
+        }
+        
+        // Handle image messages
+        if (d && d.type === "image" && typeof d.n === "string" && typeof d.url === "string") {
+          // Clear typing indicator
+          setTypingUsers((prev) => {
+            const next = new Set(prev);
+            next.delete(d.n);
+            return next;
+          });
+          
+          setLogs((prev) => [...prev, {
+            type: "image",
+            name: d.n,
+            image: d.url,
+            text: "",
+            time: currentTime()
+          }]);
+          if (!openRef.current) setHasNew(true);
+          setTimeout(() => logEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+          return;
+        }
+        
+        // Handle regular text messages
+        if (d && typeof d.n === "string" && typeof d.m === "string") {
+          // Clear typing indicator
+          setTypingUsers((prev) => {
+            const next = new Set(prev);
+            next.delete(d.n);
+            return next;
+          });
+          
+          setLogs((prev) => [...prev, {
+            type: "message",
+            name: d.n,
+            text: d.m,
+            image: "",
+            time: currentTime()
+          }]);
+          if (!openRef.current) setHasNew(true);
+          setTimeout(() => logEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+          return;
+        }
+      } catch {
+        // Not valid JSON, treat as plain text (backward compat)
+        setLogs((prev) => [...prev, {
+          type: "message",
+          name: "Unknown",
+          text: raw,
+          image: "",
+          time: currentTime()
+        }]);
+        if (!openRef.current) setHasNew(true);
+        setTimeout(() => logEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+      }
     };
   }, [wsUrl]);
 
@@ -86,11 +172,47 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
     };
   }, [wsUrl, connect]);
 
+  // Close emoji picker on outside click
+  useEffect(() => {
+    if (!showEmojiPicker) return;
+    const handleClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest(".chat-emoji-picker") && !target.closest(".chat-emoji-btn")) {
+        setShowEmojiPicker(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [showEmojiPicker]);
+
+  const sendTyping = useCallback(() => {
+    if (!wsRef.current || wsRef.current.readyState !== 1) return;
+    if (typingDebounceRef.current) clearTimeout(typingDebounceRef.current);
+    typingDebounceRef.current = setTimeout(() => {
+      wsRef.current?.send(JSON.stringify({ type: "typing", n: userName }));
+    }, TYPING_DEBOUNCE);
+  }, [userName]);
+
+  const sendImage = (file: File) => {
+    if (!wsRef.current || wsRef.current.readyState !== 1) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const dataUrl = e.target?.result as string;
+      wsRef.current?.send(JSON.stringify({ type: "image", n: userName, url: dataUrl }));
+    };
+    reader.readAsDataURL(file);
+  };
+
   const send = (e: React.FormEvent) => {
     e.preventDefault();
     const inp = inputRef.current;
     const text = inp?.value?.trim();
     if (!text || !wsRef.current || wsRef.current.readyState !== 1) return;
+    
+    // Clear typing indicators
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    if (typingDebounceRef.current) clearTimeout(typingDebounceRef.current);
+    
     wsRef.current.send(JSON.stringify({ n: userName, m: text }));
     inp!.value = "";
   };
@@ -147,19 +269,102 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
       <div className="chat-body">
         <div className="chat-messages">
           {logs.map((l, i) => (
-            <div key={i} className="chat-msg">
-              {l}
+            <div key={i} className={`chat-msg ${l.type === "image" ? "chat-msg-image" : ""}`}>
+              {l.type === "image" && l.image ? (
+                <>
+                  <div className="chat-msg-header">{l.time} - {l.name || "Unknown"}:</div>
+                  <img 
+                    src={l.image} 
+                    alt={`Image shared by ${l.name || "Unknown"}`} 
+                    className="chat-image"
+                    onError={(e) => {
+                      const target = e.target as HTMLImageElement;
+                      const parent = target.parentElement;
+                      if (parent) {
+                        target.style.display = "none";
+                        const errorDiv = document.createElement("div");
+                        errorDiv.style.cssText = "color: var(--text-muted); font-size: 0.85rem; margin-top: 0.5rem;";
+                        errorDiv.textContent = "Image failed to load";
+                        parent.appendChild(errorDiv);
+                      }
+                    }}
+                  />
+                </>
+              ) : (
+                <>{l.time} - {l.name || "Unknown"}: {l.text || ""}</>
+              )}
             </div>
           ))}
+          {typingUsers.size > 0 && (
+            <div className="chat-typing">
+              {Array.from(typingUsers).join(", ")} {typingUsers.size === 1 ? "is" : "are"} typing...
+            </div>
+          )}
           <div ref={logEndRef} />
         </div>
         <form className="chat-form" onSubmit={send}>
-          <input
-            ref={inputRef}
-            className="chat-input"
-            type="text"
-            placeholder="Type a message..."
-          />
+          <div className="chat-input-wrapper">
+            <input
+              ref={inputRef}
+              className="chat-input"
+              type="text"
+              placeholder="Type a message..."
+              onChange={sendTyping}
+              onPaste={(e) => {
+                const items = e.clipboardData.items;
+                for (let i = 0; i < items.length; i++) {
+                  if (items[i].type.indexOf("image") !== -1) {
+                    e.preventDefault();
+                    const file = items[i].getAsFile();
+                    if (file) sendImage(file);
+                    return;
+                  }
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="chat-emoji-btn"
+              onClick={() => setShowEmojiPicker(!showEmojiPicker)}
+              title="Add emoji"
+            >
+              😊
+            </button>
+            {showEmojiPicker && (
+              <div className="chat-emoji-picker">
+                {["😀", "😂", "😍", "🥰", "😎", "🤔", "👍", "❤️", "🔥", "🎉", "✅", "👏", "🙏", "💯", "🚀"].map((emoji) => (
+                  <button
+                    key={emoji}
+                    type="button"
+                    className="chat-emoji-item"
+                    onClick={() => {
+                      if (inputRef.current) {
+                        inputRef.current.value += emoji;
+                        inputRef.current.focus();
+                        sendTyping();
+                      }
+                      setShowEmojiPicker(false);
+                    }}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <label className="chat-image-btn" title="Upload image">
+            📷
+            <input
+              type="file"
+              accept="image/*"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) sendImage(file);
+                e.target.value = "";
+              }}
+            />
+          </label>
           <button type="submit" className="chat-send" disabled={!ready}>
             Send
           </button>
