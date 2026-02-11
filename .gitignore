@@ -29,3 +29,7 @@ Thumbs.db
 # Misc
 .vercel
 .cache
+
+# Recordings (video files stored on server)
+public/recordings/*.webm
+public/recordings/*.mp4

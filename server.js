@@ -41,6 +41,14 @@ function sendToPeer(room, peerId, msg) {
   if (p && p.ws.readyState === 1) p.ws.send(JSON.stringify(msg));
 }
 
+function broadcastToRoomExcept(room, excludePeerId, msg) {
+  room.peers.forEach((p, pid) => {
+    if (pid !== excludePeerId && p.ws.readyState === 1) {
+      p.ws.send(JSON.stringify(msg));
+    }
+  });
+}
+
 app.prepare().then(() => {
   startViewerCountInterval();
 
@@ -88,6 +96,7 @@ app.prepare().then(() => {
             .filter(([k]) => k !== peerId)
             .map(([pid, p]) => ({ id: pid, name: p.name || `Peer ${pid.slice(0, 4)}` })),
           viewer: false,
+          recordingPeer: room.recordingPeer || null,
         })
       );
 
@@ -123,11 +132,29 @@ app.prepare().then(() => {
           if (to && (event === "offer" || event === "answer" || event === "candidate")) {
             sendToPeer(room, to, { event, from: peerId, data });
           }
+          if (event === "recording-started") {
+            const displayName = name || peerName || `Peer ${peerId.slice(0, 4)}`;
+            room.recordingPeer = { peerId, name: displayName };
+            broadcastToRoomExcept(room, peerId, {
+              event: "recording-started",
+              peerId,
+              name: displayName,
+            });
+          }
+          if (event === "recording-stopped") {
+            if (room.recordingPeer && room.recordingPeer.peerId === peerId) {
+              room.recordingPeer = null;
+            }
+            broadcastToRoomExcept(room, peerId, { event: "recording-stopped", peerId });
+          }
         } catch (_) {}
       });
 
       ws.on("close", () => {
         room.peers.delete(peerId);
+        if (room.recordingPeer && room.recordingPeer.peerId === peerId) {
+          room.recordingPeer = null;
+        }
         room.peers.forEach((p) => {
           if (p.ws.readyState === 1) {
             p.ws.send(JSON.stringify({ event: "peer-left", peerId }));

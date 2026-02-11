@@ -519,9 +519,104 @@ a:hover {
   background: var(--danger-hover);
 }
 
+.video-control-btn.recording {
+  background: var(--danger);
+  color: #fff;
+  animation: recording-pulse 1.5s ease-in-out infinite;
+}
+.video-control-btn.recording:hover {
+  background: var(--danger-hover);
+}
+
+@keyframes recording-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
+  50% { opacity: 0.9; box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+}
+
+.recording-indicator {
+  position: absolute;
+  top: 0.75rem;
+  left: 0.75rem;
+  background: rgba(239, 68, 68, 0.9);
+  color: #fff;
+  padding: 0.4rem 0.75rem;
+  border-radius: var(--radius);
+  font-size: 0.75rem;
+  font-weight: 600;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.recording-dot {
+  width: 8px;
+  height: 8px;
+  background: #fff;
+  border-radius: 50%;
+  animation: pulse 2s infinite;
+}
+
+.recording-by-peer-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 1rem;
+  margin: 0.5rem 0 1rem;
+  background: var(--danger-muted);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  border-radius: var(--radius);
+  color: var(--danger-text);
+  font-size: 0.9rem;
+  font-weight: 600;
+  box-shadow: var(--shadow);
+}
+.recording-by-peer-banner .recording-dot {
+  background: var(--danger);
+  flex-shrink: 0;
+}
+
 .video-control-btn svg {
   width: 20px;
   height: 20px;
+}
+
+.screen-share-indicator {
+  position: absolute;
+  top: 0.75rem;
+  left: 0.75rem;
+  background: rgba(245, 158, 11, 0.9);
+  color: #000;
+  padding: 0.4rem 0.75rem;
+  border-radius: var(--radius);
+  font-size: 0.75rem;
+  font-weight: 600;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.screen-share-indicator::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  background: #000;
+  border-radius: 50%;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
 }
 
 .mirror {

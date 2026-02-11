@@ -85,6 +85,120 @@ function getWsBase() {
 
 const CHAT_NAME_KEY = "nexus-chat-name";
 
+const CANVAS_WIDTH = 1280;
+const CANVAS_HEIGHT = 720;
+
+type ParticipantInfo = { id: string; stream: MediaStream; label: string };
+
+async function createMeetingCompositeStream(
+  getParticipants: () => ParticipantInfo[]
+): Promise<{ stream: MediaStream; cleanup: () => void }> {
+  const canvas = document.createElement("canvas");
+  canvas.width = CANVAS_WIDTH;
+  canvas.height = CANVAS_HEIGHT;
+  const ctx = canvas.getContext("2d")!;
+
+  const videoEls = new Map<string, HTMLVideoElement>();
+  const audioCtx = new AudioContext();
+  const audioDest = audioCtx.createMediaStreamDestination();
+  const audioSources = new Map<string, MediaStreamAudioSourceNode>();
+
+  function syncParticipants(current: ParticipantInfo[]) {
+    const currentIds = new Set(current.map((p) => p.id));
+    for (const id of Array.from(videoEls.keys())) {
+      if (!currentIds.has(id)) {
+        const v = videoEls.get(id)!;
+        v.srcObject = null;
+        videoEls.delete(id);
+        const src = audioSources.get(id);
+        if (src) {
+          src.disconnect();
+          audioSources.delete(id);
+        }
+      }
+    }
+    for (const p of current) {
+      if (!videoEls.has(p.id)) {
+        const v = document.createElement("video");
+        v.srcObject = p.stream;
+        v.muted = false;
+        v.playsInline = true;
+        v.autoplay = true;
+        v.play().catch(() => {});
+        videoEls.set(p.id, v);
+        if (p.stream.getAudioTracks().length > 0) {
+          const src = audioCtx.createMediaStreamSource(p.stream);
+          src.connect(audioDest);
+          audioSources.set(p.id, src);
+        }
+      }
+    }
+  }
+
+  syncParticipants(getParticipants());
+
+  let animationId: number;
+  const draw = () => {
+    const participants = getParticipants();
+    syncParticipants(participants);
+
+    const n = participants.length;
+    if (n === 0) {
+      ctx.fillStyle = "#1e293b";
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    } else {
+      const cols = n <= 2 ? n : Math.ceil(Math.sqrt(n));
+      const rows = Math.ceil(n / cols);
+      const cellW = CANVAS_WIDTH / cols;
+      const cellH = CANVAS_HEIGHT / rows;
+
+      ctx.fillStyle = "#1e293b";
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+      for (let i = 0; i < participants.length; i++) {
+        const p = participants[i];
+        const v = videoEls.get(p.id);
+        if (!v) continue;
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const x = col * cellW;
+        const y = row * cellH;
+        if (v.readyState >= 2) {
+          ctx.drawImage(v, x, y, cellW, cellH);
+        }
+        ctx.fillStyle = "rgba(0,0,0,0.6)";
+        ctx.fillRect(x, y + cellH - 28, cellW, 28);
+        ctx.fillStyle = "#fff";
+        ctx.font = "14px system-ui";
+        ctx.fillText(p.label, x + 8, y + cellH - 10);
+      }
+    }
+    animationId = requestAnimationFrame(draw);
+  };
+  draw();
+
+  const canvasStream = canvas.captureStream(30);
+
+  const compositeStream = new MediaStream();
+  canvasStream.getVideoTracks().forEach((t) => compositeStream.addTrack(t));
+  if (audioDest.stream.getAudioTracks().length > 0) {
+    audioDest.stream.getAudioTracks().forEach((t) => compositeStream.addTrack(t));
+  }
+
+  const cleanup = () => {
+    cancelAnimationFrame(animationId);
+    videoEls.forEach((v) => {
+      v.srcObject = null;
+    });
+    videoEls.clear();
+    audioSources.forEach((src) => src.disconnect());
+    audioSources.clear();
+    audioCtx.close();
+  };
+
+  return { stream: compositeStream, cleanup };
+}
+
 function NameInputModal({ onJoin }: { onJoin: (name: string) => void }) {
   const [name, setName] = useState("");
   const [error, setError] = useState("");
@@ -158,10 +272,24 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
   const [userName, setUserName] = useState<string | null>(null);
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoEnabled, setIsVideoEnabled] = useState(true);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [peerNames, setPeerNames] = useState<Record<string, string>>({});
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingStatus, setRecordingStatus] = useState<"idle" | "uploading" | "saved" | "error">("idle");
+  const [recordingPeer, setRecordingPeer] = useState<{ id: string; name: string } | null>(null);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const compositeCleanupRef = useRef<(() => void) | null>(null);
+  const remoteStreamsRef = useRef(remoteStreams);
+  const peerNamesRef = useRef(peerNames);
+  useEffect(() => {
+    remoteStreamsRef.current = remoteStreams;
+    peerNamesRef.current = peerNames;
+  }, [remoteStreams, peerNames]);
   const localStreamRef = useRef<MediaStream | null>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const wsRef = useRef<WebSocket | null>(null);
   const myIdRef = useRef<string | null>(null);
@@ -179,7 +307,7 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
     navigator.clipboard?.writeText(text).then(() => {});
   };
 
-  const send = useCallback((msg: { to?: string; event: string; data?: string }) => {
+  const send = useCallback((msg: { to?: string; event: string; data?: string; name?: string }) => {
     if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify(msg));
   }, []);
 
@@ -197,7 +325,13 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
       if (!myId || myId >= peerId) return;
       const pc = new RTCPeerConnection(ICE);
       peersRef.current.set(peerId, pc);
-      stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+      
+      // Use screen stream if sharing, otherwise use camera stream
+      const streamToUse = isScreenSharing && screenStreamRef.current 
+        ? screenStreamRef.current 
+        : stream;
+      
+      streamToUse.getTracks().forEach((t) => pc.addTrack(t, streamToUse));
       pc.onicecandidate = (e) => {
         if (e.candidate) send({ to: peerId, event: "candidate", data: JSON.stringify(e.candidate.toJSON()) });
       };
@@ -241,7 +375,7 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
         .then(() => send({ to: peerId, event: "offer", data: JSON.stringify(pc.localDescription) }))
         .catch((err) => console.error(`[${peerId}] Offer error:`, err));
     },
-    [send]
+    [send, isScreenSharing]
   );
 
   const connectRoomWs = useCallback(() => {
@@ -276,8 +410,12 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data as string);
       const stream = localStreamRef.current!;
+      // Use screen stream if sharing, otherwise use camera stream
+      const activeStream = isScreenSharing && screenStreamRef.current 
+        ? screenStreamRef.current 
+        : stream;
 
-      if (msg.event === "joined") {
+        if (msg.event === "joined") {
         myIdRef.current = msg.peerId;
         // Store peer names from the joined message
         if (msg.peers && Array.isArray(msg.peers)) {
@@ -285,25 +423,32 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
           msg.peers.forEach((p: { id: string; name?: string } | string) => {
             if (typeof p === 'object' && p.id) {
               names[p.id] = p.name || `Peer ${p.id.slice(0, 4)}`;
-              createOfferTo(p.id, stream);
+              createOfferTo(p.id, activeStream);
             } else if (typeof p === 'string') {
               // Backward compatibility
-              createOfferTo(p, stream);
+              createOfferTo(p, activeStream);
             }
           });
           setPeerNames(names);
         } else {
           // Backward compatibility
-          (msg.peers || []).forEach((p: string) => createOfferTo(p, stream));
+          (msg.peers || []).forEach((p: string) => createOfferTo(p, activeStream));
         }
         // Name should already be sent in onopen, but send again to be sure
         if (userName && ws.readyState === 1) {
           ws.send(JSON.stringify({ event: "set-name", name: userName }));
         }
+        // Show who is recording if someone started before we joined
+        if (msg.recordingPeer && msg.recordingPeer.peerId && msg.recordingPeer.name) {
+          setRecordingPeer({
+            id: msg.recordingPeer.peerId,
+            name: msg.recordingPeer.name,
+          });
+        }
         return;
       }
       if (msg.event === "new-peer") {
-        createOfferTo(msg.peerId, stream);
+        createOfferTo(msg.peerId, activeStream);
         // Store the peer's name (use provided name or wait for update)
         setPeerNames((prev) => {
           const newNames = { ...prev };
@@ -344,6 +489,18 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
           delete n[msg.peerId];
           return n;
         });
+        setRecordingPeer((prev) => (prev?.id === msg.peerId ? null : prev));
+        return;
+      }
+      if (msg.event === "recording-started") {
+        setRecordingPeer({
+          id: msg.peerId,
+          name: msg.name || `Peer ${msg.peerId?.slice(0, 4) || "?"}`,
+        });
+        return;
+      }
+      if (msg.event === "recording-stopped") {
+        setRecordingPeer((prev) => (prev?.id === msg.peerId ? null : prev));
         return;
       }
       if (msg.event === "offer") {
@@ -353,8 +510,11 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
           pc = new RTCPeerConnection(ICE);
           peersRef.current.set(from, pc);
           
-          // Add local tracks to the connection
-          stream.getTracks().forEach((t) => pc!.addTrack(t, stream));
+          // Add local tracks to the connection (use screen stream if sharing)
+          const streamToUse = isScreenSharing && screenStreamRef.current 
+            ? screenStreamRef.current 
+            : activeStream;
+          streamToUse.getTracks().forEach((t) => pc!.addTrack(t, streamToUse));
           
           pc!.onicecandidate = (e) => {
             if (e.candidate) send({ to: from, event: "candidate", data: JSON.stringify(e.candidate.toJSON()) });
@@ -423,7 +583,7 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
         }
       }
     };
-  }, [roomWsUrl, createOfferTo, send, flushCandidates, userName]);
+  }, [roomWsUrl, createOfferTo, send, flushCandidates, userName, isScreenSharing]);
 
   // Send name update when userName changes and WebSocket is connected
   useEffect(() => {
@@ -473,6 +633,7 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
       .catch(() => setNoPerm(true));
     return () => {
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
+      screenStreamRef.current?.getTracks().forEach((t) => t.stop());
       wsRef.current?.close();
       peersRef.current.forEach((pc) => pc.close());
     };
@@ -522,6 +683,330 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
     });
   }, [isVideoEnabled]);
 
+  // Replace video track in all peer connections
+  const replaceVideoTrack = useCallback((newTrack: MediaStreamTrack | null) => {
+    if (!newTrack) {
+      console.warn('replaceVideoTrack called with null track');
+      return;
+    }
+    
+    console.log('Replacing video track in', peersRef.current.size, 'peer connections');
+    console.log('New track ID:', newTrack.id, 'Kind:', newTrack.kind, 'Enabled:', newTrack.enabled);
+    
+    let replacedCount = 0;
+    let failedCount = 0;
+    
+    peersRef.current.forEach((pc, peerId) => {
+      // Only replace if connection is established
+      const state = pc.connectionState;
+      if (state === 'closed' || state === 'failed') {
+        console.log(`[${peerId}] Skipping track replacement - connection state:`, state);
+        return;
+      }
+      
+      // Prefer "connected" state, but also allow "connecting" and "new"
+      if (state !== 'connected' && state !== 'connecting' && state !== 'new') {
+        console.log(`[${peerId}] Connection not ready for track replacement - state:`, state);
+        // Don't return - still try to replace as it might work
+      }
+      
+      console.log(`[${peerId}] Connection state:`, state);
+      
+      const senders = pc.getSenders();
+      console.log(`[${peerId}] Total senders:`, senders.length);
+      
+      let videoSender = senders.find((s) => s.track && s.track.kind === 'video');
+      
+      if (videoSender) {
+        // Replace existing video track
+        const oldTrack = videoSender.track;
+        console.log(`[${peerId}] Replacing existing video track. Old track ID:`, oldTrack?.id);
+        
+        videoSender.replaceTrack(newTrack).then(() => {
+          replacedCount++;
+          console.log(`[${peerId}] ✅ Video track replaced successfully. New track ID:`, newTrack.id);
+        }).catch((err) => {
+          failedCount++;
+          console.error(`[${peerId}] ❌ Error replacing track:`, err);
+        });
+      } else {
+        // No video sender exists - this shouldn't happen if connection was established properly
+        console.warn(`[${peerId}] ⚠️ No video sender found! Connection might not be fully established.`);
+        console.log(`[${peerId}] Available senders:`, senders.map(s => ({ kind: s.track?.kind, id: s.track?.id })));
+        
+        // Try to add the track anyway
+        const stream = isScreenSharing && screenStreamRef.current 
+          ? screenStreamRef.current 
+          : localStreamRef.current;
+        if (stream) {
+          try {
+            const sender = pc.addTrack(newTrack, stream);
+            console.log(`[${peerId}] Track added as new sender. Sender:`, sender);
+          } catch (err: any) {
+            console.error(`[${peerId}] Error adding track:`, err);
+          }
+        } else {
+          console.warn(`[${peerId}] No stream available to add track to`);
+        }
+      }
+    });
+    
+    console.log(`Track replacement summary: ${replacedCount} succeeded, ${failedCount} failed`);
+  }, [isScreenSharing]);
+
+  // Start screen sharing
+  const startScreenShare = useCallback(async () => {
+    try {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { width: { max: 1920 }, height: { max: 1080 }, frameRate: 30 },
+        audio: false, // Screen share typically doesn't include audio
+      });
+      
+      screenStreamRef.current = screenStream;
+      setIsScreenSharing(true);
+      
+      // Get the video track from screen stream
+      const screenVideoTrack = screenStream.getVideoTracks()[0];
+      
+      if (!screenVideoTrack) {
+        console.error('No video track in screen stream');
+        return;
+      }
+      
+      console.log('Starting screen share, replacing tracks in', peersRef.current.size, 'peer connections');
+      console.log('Screen video track:', {
+        id: screenVideoTrack.id,
+        kind: screenVideoTrack.kind,
+        enabled: screenVideoTrack.enabled,
+        readyState: screenVideoTrack.readyState,
+        label: screenVideoTrack.label
+      });
+      
+      // Replace video track immediately
+      replaceVideoTrack(screenVideoTrack);
+      
+      // Set up connection state listeners to replace track when connections become ready
+      peersRef.current.forEach((pc, peerId) => {
+        const handleConnectionStateChange = () => {
+          const state = pc.connectionState;
+          if (state === 'connected' && isScreenSharing && screenStreamRef.current) {
+            console.log(`[${peerId}] Connection became connected, replacing track`);
+            const senders = pc.getSenders();
+            const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
+            if (videoSender) {
+              videoSender.replaceTrack(screenVideoTrack).then(() => {
+                console.log(`[${peerId}] Track replaced after connection established`);
+              }).catch((err) => {
+                console.error(`[${peerId}] Error replacing track after connection:`, err);
+              });
+            }
+          }
+        };
+        
+        // Add listener if not already connected
+        if (pc.connectionState !== 'connected') {
+          pc.addEventListener('connectionstatechange', handleConnectionStateChange);
+          // Remove listener after connection is established or after timeout
+          setTimeout(() => {
+            pc.removeEventListener('connectionstatechange', handleConnectionStateChange);
+          }, 10000);
+        }
+      });
+      
+      // Retry after delays for connections that might not have been ready
+      setTimeout(() => {
+        console.log('Retrying track replacement after 500ms...');
+        replaceVideoTrack(screenVideoTrack);
+      }, 500);
+      
+      setTimeout(() => {
+        console.log('Retrying track replacement after 2000ms...');
+        replaceVideoTrack(screenVideoTrack);
+      }, 2000);
+      
+      // Update local video display
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = screenStream;
+      }
+      
+      // Handle screen share end (user clicks stop sharing in browser UI)
+      screenVideoTrack.onended = () => {
+        stopScreenShare();
+      };
+      
+    } catch (err) {
+      console.error('Error starting screen share:', err);
+      alert('Failed to start screen sharing. Please check your browser permissions.');
+    }
+  }, [replaceVideoTrack]);
+
+  // Stop screen sharing
+  const stopScreenShare = useCallback(() => {
+    console.log('Stopping screen share');
+    
+    if (screenStreamRef.current) {
+      // Stop all tracks in screen stream
+      screenStreamRef.current.getTracks().forEach((track) => track.stop());
+      screenStreamRef.current = null;
+    }
+    
+    setIsScreenSharing(false);
+    
+    // Restore camera video track
+    if (localStreamRef.current) {
+      const cameraVideoTrack = localStreamRef.current.getVideoTracks()[0];
+      if (cameraVideoTrack) {
+        console.log('Restoring camera track');
+        replaceVideoTrack(cameraVideoTrack);
+        
+        // Update local video display
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = localStreamRef.current;
+        }
+      } else {
+        console.warn('No camera track available to restore');
+      }
+    }
+  }, [replaceVideoTrack]);
+
+  // Start recording - full meeting composite (all participants in one frame)
+  const startRecording = useCallback(async () => {
+    const localStream = isScreenSharing && screenStreamRef.current
+      ? (() => {
+          const s = new MediaStream();
+          screenStreamRef.current!.getVideoTracks().forEach((t) => s.addTrack(t));
+          localStreamRef.current?.getAudioTracks().forEach((t) => s.addTrack(t));
+          return s;
+        })()
+      : localStreamRef.current;
+    if (!localStream || localStream.getTracks().length === 0) {
+      alert("No stream available to record.");
+      return;
+    }
+    try {
+      const getParticipants = () => {
+        const remotes = remoteStreamsRef.current;
+        const names = peerNamesRef.current;
+        const local: ParticipantInfo = {
+          id: "local",
+          stream: localStream,
+          label: userName || "You",
+        };
+        const remoteList: ParticipantInfo[] = Object.entries(remotes).map(([id, s]) => ({
+          id,
+          stream: s,
+          label: names[id] || `Peer ${id.slice(0, 4)}`,
+        }));
+        return [local, ...remoteList];
+      };
+      const { stream: compositeStream, cleanup } = await createMeetingCompositeStream(getParticipants);
+      compositeCleanupRef.current = cleanup;
+
+      if (compositeStream.getTracks().length === 0) {
+        cleanup();
+        alert("Could not create meeting composite.");
+        return;
+      }
+
+      recordingChunksRef.current = [];
+      const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
+        ? "video/webm;codecs=vp9"
+        : "video/webm";
+      const recorder = new MediaRecorder(compositeStream, {
+        mimeType,
+        videoBitsPerSecond: 2500000,
+        audioBitsPerSecond: 128000,
+      });
+      mediaRecorderRef.current = recorder;
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) recordingChunksRef.current.push(e.data);
+      };
+      recorder.onstop = async () => {
+        compositeCleanupRef.current?.();
+        compositeCleanupRef.current = null;
+        const blob = new Blob(recordingChunksRef.current, { type: mimeType });
+        setRecordingStatus("uploading");
+        try {
+          const formData = new FormData();
+          const now = new Date();
+          const pad = (n: number) => String(n).padStart(2, "0");
+          const dateTime =
+            `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-` +
+            `${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+          const filename = `recorded-meeting-${uuid}-${dateTime}.webm`;
+          formData.append("file", blob, filename);
+          formData.append("roomId", uuid);
+          const res = await fetch("/api/recordings", {
+            method: "POST",
+            body: formData,
+          });
+          if (!res.ok) throw new Error("Upload failed");
+          const data = await res.json();
+          setRecordingStatus("saved");
+          setIsRecording(false);
+          setTimeout(() => setRecordingStatus("idle"), 3000);
+          const a = document.createElement("a");
+          if (data.compressed && data.url) {
+            const blobRes = await fetch(data.url);
+            const compressedBlob = await blobRes.blob();
+            a.href = URL.createObjectURL(compressedBlob);
+          } else {
+            a.href = URL.createObjectURL(blob);
+          }
+          a.download = data.filename || filename;
+          a.click();
+          URL.revokeObjectURL(a.href);
+        } catch (err) {
+          console.error("Upload error:", err);
+          setRecordingStatus("error");
+          setIsRecording(false);
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          const now = new Date();
+          const pad = (n: number) => String(n).padStart(2, "0");
+          const dateTime =
+            `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-` +
+            `${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+          a.download = `recorded-meeting-${dateTime}.webm`;
+          a.click();
+          URL.revokeObjectURL(a.href);
+          setTimeout(() => setRecordingStatus("idle"), 3000);
+          alert("Recording saved locally. Server upload failed.");
+        }
+        mediaRecorderRef.current = null;
+      };
+      recorder.start(1000);
+      setIsRecording(true);
+      setRecordingStatus("idle");
+      send({ event: "recording-started", name: userName || "You" });
+    } catch (err) {
+      console.error("Recording error:", err);
+      compositeCleanupRef.current?.();
+      compositeCleanupRef.current = null;
+      alert("Failed to start recording.");
+    }
+  }, [uuid, isScreenSharing, remoteStreams, peerNames, userName, send]);
+
+  // Stop recording
+  const stopRecording = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      send({ event: "recording-stopped" });
+      mediaRecorderRef.current.stop();
+      // isRecording stays true until onstop completes (shows "Saving…")
+    }
+  }, [send]);
+
+  // Cleanup recorder on unmount
+  useEffect(() => {
+    return () => {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
+      }
+      compositeCleanupRef.current?.();
+      compositeCleanupRef.current = null;
+    };
+  }, []);
+
   // Show name input modal if name not set
   if (!userName) {
     return <NameInputModal onJoin={(name) => setUserName(name)} />;
@@ -558,6 +1043,13 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
 
       <div className="viewer-badge">Viewers: {viewerCount}</div>
 
+      {recordingPeer && !isRecording && (
+        <div className="recording-by-peer-banner">
+          <span className="recording-dot" />
+          <span>{recordingPeer.name} is recording this meeting</span>
+        </div>
+      )}
+
       {noPerm && (
         <div className="notif notif-info">
           Camera and microphone permissions are needed to join.
@@ -568,7 +1060,7 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
         <div id="peers">
           <div className="video-grid" id="videos">
             <div className="video-tile you">
-              <video ref={localVideoRef} className="mirror" autoPlay muted playsInline style={{ opacity: isVideoEnabled ? 1 : 0.3 }} />
+              <video ref={localVideoRef} className={isScreenSharing ? '' : 'mirror'} autoPlay muted playsInline style={{ opacity: isVideoEnabled || isScreenSharing ? 1 : 0.3 }} />
               {!isVideoEnabled && (
                 <div className="video-placeholder">
                   <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -620,7 +1112,58 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
                     </svg>
                   )}
                 </button>
+                <button
+                  type="button"
+                  className={`video-control-btn ${isScreenSharing ? 'active' : ''}`}
+                  onClick={isScreenSharing ? stopScreenShare : startScreenShare}
+                  title={isScreenSharing ? 'Stop sharing screen' : 'Share screen'}
+                  aria-label={isScreenSharing ? 'Stop sharing screen' : 'Share screen'}
+                >
+                  {isScreenSharing ? (
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+                      <line x1="8" y1="21" x2="16" y2="21" />
+                      <line x1="12" y1="17" x2="12" y2="21" />
+                      <path d="M7 13l5 5 5-5" />
+                    </svg>
+                  ) : (
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+                      <line x1="8" y1="21" x2="16" y2="21" />
+                      <line x1="12" y1="17" x2="12" y2="21" />
+                    </svg>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  className={`video-control-btn ${isRecording ? 'recording' : ''}`}
+                  onClick={isRecording ? stopRecording : startRecording}
+                  title={isRecording ? 'Stop recording' : 'Start recording'}
+                  aria-label={isRecording ? 'Stop recording' : 'Start recording'}
+                >
+                  {isRecording ? (
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                      <rect x="6" y="6" width="12" height="12" rx="2" />
+                    </svg>
+                  ) : (
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <circle cx="12" cy="12" r="10" />
+                      <circle cx="12" cy="12" r="3" fill="currentColor" />
+                    </svg>
+                  )}
+                </button>
               </div>
+              {isScreenSharing && (
+                <div className="screen-share-indicator">
+                  <span>Sharing Screen</span>
+                </div>
+              )}
+              {isRecording && (
+                <div className="recording-indicator">
+                  <span className="recording-dot" />
+                  <span>{recordingStatus === "uploading" ? "Saving…" : recordingStatus === "saved" ? "Saved!" : "Recording"}</span>
+                </div>
+              )}
             </div>
             {!hasPeers && !connClosed && (
               <div className="notif notif-warn" style={{ gridColumn: "1 / -1" }}>

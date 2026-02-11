@@ -3,6 +3,9 @@ FROM node:20-alpine
 
 WORKDIR /app
 
+# Install FFmpeg for recording compression (libx264)
+RUN apk add --no-cache ffmpeg
+
 # Install deps
 COPY package*.json ./
 RUN npm install --legacy-peer-deps
