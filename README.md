@@ -122,41 +122,41 @@ The same Node.js process serves:
 
 ```mermaid
 flowchart TB
-  subgraph Client_A["Browser - Peer A"]
-    UI_A["Next.js UI<br/>(React Components)"]
-    RTC_A["RTCPeerConnection(s)"]
-    Media_A["getUserMedia /<br/>getDisplayMedia"]
+  subgraph Client_A["Browser Peer A"]
+    UI_A["Next.js UI React"]
+    RTC_A["RTCPeerConnections"]
+    Media_A["getUserMedia getDisplayMedia"]
     UI_A --> RTC_A
     Media_A --> RTC_A
   end
 
-  subgraph Client_B["Browser - Peer B"]
-    UI_B["Next.js UI<br/>(React Components)"]
-    RTC_B["RTCPeerConnection(s)"]
-    Media_B["getUserMedia /<br/>getDisplayMedia"]
+  subgraph Client_B["Browser Peer B"]
+    UI_B["Next.js UI React"]
+    RTC_B["RTCPeerConnections"]
+    Media_B["getUserMedia getDisplayMedia"]
     UI_B --> RTC_B
     Media_B --> RTC_B
   end
 
-  subgraph Server["Node.js Process - server.js"]
-    HTTP["HTTP Handler<br/>(Next.js SSR/API)"]
-    WSS["WebSocket Server<br/>(ws)"]
-    State[("In-Memory State<br/>rooms: Map&lt;uuid, Room&gt;")]
-    HTTP -.serves UI.-> UI_A
-    HTTP -.serves UI.-> UI_B
+  subgraph Server["Node server.js"]
+    HTTP["HTTP Next.js"]
+    WSS["WebSocket ws"]
+    State[("In-memory rooms map")]
+    HTTP -. UI .-> UI_A
+    HTTP -. UI .-> UI_B
     WSS --> State
   end
 
-  subgraph STUN["Google STUN Servers"]
+  subgraph STUN["Google STUN"]
     S1["stun.l.google.com:19302"]
     S2["stun1.l.google.com:19302"]
   end
 
-  UI_A <-- "ws: signaling + chat + viewer" --> WSS
-  UI_B <-- "ws: signaling + chat + viewer" --> WSS
-  RTC_A <-. "ICE / STUN" .-> STUN
-  RTC_B <-. "ICE / STUN" .-> STUN
-  RTC_A <== "Direct P2P Media (SRTP)" ==> RTC_B
+  UI_A <-->|signaling chat viewer| WSS
+  UI_B <-->|signaling chat viewer| WSS
+  RTC_A <-. ICE STUN .-> S1
+  RTC_B <-. ICE STUN .-> S2
+  RTC_A <-->|SRTP media P2P| RTC_B
 ```
 
 **Key insight:** The server is **only** used for signaling, chat fan-out, and viewer-count broadcast. Once the WebRTC handshake completes, **media never traverses the server** — it goes peer-to-peer.
@@ -216,12 +216,12 @@ NexusRTC/
 
 ```mermaid
 flowchart TB
-  Layout["app/layout.tsx<br/><i>RootLayout</i>"]
+  Layout["layout.tsx RootLayout"]
   Theme["ThemeProvider"]
-  Welcome["app/page.tsx<br/><i>WelcomePage</i>"]
-  Create["app/room/create/page.tsx<br/><i>redirect → /room/&lt;uuid&gt;</i>"]
-  RoomRoute["app/room/[uuid]/page.tsx<br/><i>RoomRoute (server)</i>"]
-  RoomPage["RoomPage.tsx<br/><i>Client</i>"]
+  Welcome["page.tsx WelcomePage"]
+  Create["room/create redirects to new uuid"]
+  RoomRoute["room/uuid page RoomRoute server"]
+  RoomPage["RoomPage.tsx client"]
   NameModal["NameInputModal"]
   Chat["Chat.tsx"]
   RemoteVideo["RemoteVideo"]
@@ -324,52 +324,49 @@ Two clients connecting — Alice first, then Bob. Note the **"lowest ID offers"*
 ```mermaid
 sequenceDiagram
   autonumber
-  participant A as Alice (Browser)
-  participant S as Signaling Server<br/>(/room/&lt;uuid&gt;/websocket)
-  participant B as Bob (Browser)
+  participant A as Alice browser
+  participant S as Signaling WS room uuid websocket
+  participant B as Bob browser
 
-  A->>A: getUserMedia()
+  A->>A: getUserMedia
   A->>S: WS Connect
-  S-->>A: { event: "joined", peerId: A_id, peers: [] }
-  A->>S: { event: "set-name", name: "Alice" }
+  S-->>A: joined peerId A_id peers empty
+  A->>S: set-name Alice
 
   Note over B: Bob opens room link
-  B->>B: getUserMedia()
+  B->>B: getUserMedia
   B->>S: WS Connect
-  S-->>B: { event: "joined", peerId: B_id, peers: [{ id:A_id, name:"Alice" }] }
-  B->>S: { event: "set-name", name: "Bob" }
-  S-->>A: { event: "new-peer", peerId: B_id, name: "Bob" }
+  S-->>B: joined peerId B_id peers include Alice
+  B->>S: set-name Bob
+  S-->>A: new-peer peerId B_id name Bob
 
-  Note over A,B: Each peer decides who offers:<br/>"myId &lt; peerId" → I offer
-  alt A_id &lt; B_id
-    A->>A: pc = new RTCPeerConnection(ICE)
-    A->>A: addTrack(localStream)
-    A->>A: createOffer + setLocalDescription
-    A->>S: { to: B_id, event: "offer", data: SDP }
-    S-->>B: { from: A_id, event: "offer", data: SDP }
-    B->>B: pc = new RTCPeerConnection(ICE)
-    B->>B: addTrack(localStream)
-    B->>B: setRemoteDescription(offer)
-    B->>B: createAnswer + setLocalDescription
-    B->>S: { to: A_id, event: "answer", data: SDP }
-    S-->>A: { from: B_id, event: "answer", data: SDP }
-    A->>A: setRemoteDescription(answer)
+  Note over A,B: Peer with lexicographically smaller peerId sends the offer
+  alt smaller peerId is Alice
+    A->>A: RTCPeerConnection addTrack createOffer
+    A->>S: relay offer to B_id
+    S-->>B: offer from A_id
+    B->>B: RTCPeerConnection addTrack createAnswer
+    B->>S: relay answer to A_id
+    S-->>A: answer from B_id
+    A->>A: setRemoteDescription answer
   end
 
-  par ICE candidate trickle
-    A->>S: { to: B_id, event: "candidate", data: ICE }
-    S-->>B: { from: A_id, event: "candidate", data: ICE }
-    B->>B: addIceCandidate (queue if remoteDescription not set yet)
-  and
-    B->>S: { to: A_id, event: "candidate", data: ICE }
-    S-->>A: { from: B_id, event: "candidate", data: ICE }
+  par ICE trickle direction A to B
+    A->>S: candidate toward B_id
+    S-->>B: candidate from A_id
+    B->>B: addIceCandidate maybe queued
+  and ICE trickle direction B to A
+    B->>S: candidate toward A_id
+    S-->>A: candidate from B_id
     A->>A: addIceCandidate
   end
 
-  Note over A,B: Direct P2P media flowing<br/>(SRTP via STUN-resolved addresses)
-  A-->>B: Audio + Video (P2P)
-  B-->>A: Audio + Video (P2P)
+  Note over A,B: SRTP media flows peer to peer after ICE
+  A-->>B: audio video P2P
+  B-->>A: audio video P2P
 ```
+
+Diagram labels are shortened so GitHub Mermaid renders reliably; real payloads match the JSON envelopes in **WebSocket Routes & Protocol** above.
 
 ### Chat Message Flow
 
@@ -377,20 +374,20 @@ sequenceDiagram
 sequenceDiagram
   autonumber
   participant A as Alice
-  participant H as Chat Hub<br/>(/room/&lt;uuid&gt;/chat/websocket)
+  participant H as Chat hub room uuid chat websocket
   participant B as Bob
   participant C as Carol
 
-  A->>A: User types → debounce 500ms
-  A->>H: { type: "typing", n: "Alice" }
-  H-->>B: { type: "typing", n: "Alice" }
-  H-->>C: { type: "typing", n: "Alice" }
-  Note over B,C: Show "Alice is typing..."<br/>auto-clear in 3s
+  A->>A: typing debounce 500ms
+  A->>H: typing payload Alice
+  H-->>B: typing payload Alice
+  H-->>C: typing payload Alice
+  Note over B,C: typing indicator clears after 3s
 
-  A->>H: { n: "Alice", m: "hello team" }
-  H-->>A: (echo) { n: "Alice", m: "hello team" }
-  H-->>B: { n: "Alice", m: "hello team" }
-  H-->>C: { n: "Alice", m: "hello team" }
+  A->>H: chat text hello team from Alice
+  H-->>A: broadcast echo to Alice
+  H-->>B: broadcast to Bob
+  H-->>C: broadcast to Carol
 ```
 
 > **Note:** The chat hub is a simple **broadcast-to-all-in-room** model. Images are sent as **base64 data URLs** inline — fine for small images, but be careful with very large files in production.
@@ -403,12 +400,12 @@ sequenceDiagram
   participant State as room-state.js
   participant Client as Browser
 
-  Note over Server: On boot:<br/>startViewerCountInterval()
+  Note over Server: On boot startViewerCountInterval
   loop Every 1 second
-    State->>State: For each room: count = room.peers.size
-    State-->>Client: send(count) via /room/&lt;uuid&gt;/viewer/websocket
+    State->>State: count peers per room
+    State-->>Client: push count on viewer websocket
   end
-  Client->>Client: setViewerCount(count) → re-render badge
+  Client->>Client: update viewer badge in UI
 ```
 
 ### Screen Sharing Flow
@@ -419,31 +416,30 @@ Screen share uses **`replaceTrack()`** — no renegotiation needed, so peers see
 sequenceDiagram
   autonumber
   participant U as User
-  participant L as Local (RoomPage)
-  participant PCs as All RTCPeerConnections
-  participant R as Remote Peers
+  participant L as RoomPage local
+  participant PCs as Peer connections
+  participant R as Remote peers
 
-  U->>L: Click "Share screen"
-  L->>L: navigator.mediaDevices.getDisplayMedia()
-  L->>L: screenStreamRef = newStream
-  L->>L: setIsScreenSharing(true)
+  U->>L: start screen share
+  L->>L: getDisplayMedia
+  L->>L: store screen stream ref
+  L->>L: set screen sharing true
 
-  loop For each peer connection
-    L->>PCs: sender = pc.getSenders().find(kind=video)
-    L->>PCs: sender.replaceTrack(screenVideoTrack)
+  loop each RTCPeerConnection
+    L->>PCs: find video sender replaceTrack screen
   end
-  PCs-->>R: Stream now shows screen<br/>(no SDP renegotiation needed)
+  PCs-->>R: remote sees screen without new SDP
 
-  L->>L: localVideo.srcObject = screenStream
-  Note over L: screenVideoTrack.onended →<br/>auto stopScreenShare()
+  L->>L: bind local preview to screen stream
+  Note over L: track onended calls stopScreenShare
 
-  U->>L: Click "Stop sharing"
-  L->>L: screenStream.getTracks().forEach(stop)
-  loop For each peer connection
-    L->>PCs: sender.replaceTrack(cameraVideoTrack)
+  U->>L: stop screen share
+  L->>L: stop screen tracks
+  loop each RTCPeerConnection
+    L->>PCs: replaceTrack camera video
   end
-  PCs-->>R: Stream switches back to camera
-  L->>L: localVideo.srcObject = localStream
+  PCs-->>R: remote sees camera again
+  L->>L: bind local preview to camera stream
 ```
 
 ### Peer Leaving Flow
@@ -454,13 +450,14 @@ sequenceDiagram
   participant S as Server
   participant B as Bob
 
-  A->>S: WS close (tab closed / navigation)
-  S->>S: room.peers.delete(A_id)
-  S-->>B: { event: "peer-left", peerId: A_id }
-  B->>B: pc.close(); peersRef.delete(A_id)
-  B->>B: setRemoteStreams → remove A_id
-  B->>B: setPeerNames → remove A_id
-  Note over B: Alice's tile disappears from grid
+  A->>S: websocket close tab or navigate away
+  S->>S: remove Alice from room peers map
+  S-->>B: peer-left event for A_id
+  B->>B: RTCPeerConnection close for Alice
+  B->>B: peersRef delete A_id
+  B->>B: remoteStreams omit A_id
+  B->>B: peerNames omit A_id
+  Note over B: Alice video tile removed from grid
 ```
 
 ---
@@ -511,15 +508,15 @@ classDiagram
     +bool isVideoEnabled
     +bool isScreenSharing
     +string viewerCount
-    +Record~peerId, MediaStream~ remoteStreams
-    +Record~peerId, string~ peerNames
+    +remoteStreams map peerId to MediaStream
+    +peerNames map peerId to string
     --
-    +Ref localStreamRef : MediaStream
-    +Ref screenStreamRef : MediaStream
-    +Ref peersRef : Map~peerId, RTCPeerConnection~
-    +Ref candidateQueueRef : Map~peerId, RTCIceCandidateInit[]~
-    +Ref wsRef : WebSocket
-    +Ref myIdRef : string
+    localStreamRef
+    screenStreamRef
+    peersRef map peerId to RTCPeerConnection
+    candidateQueueRef per peer ICE queue
+    wsRef
+    myIdRef
   }
 ```
 
@@ -529,15 +526,15 @@ classDiagram
 
 ```mermaid
 stateDiagram-v2
-  [*] --> New: new RTCPeerConnection(ICE)
-  New --> Connecting: addTrack() + createOffer/Answer
+  [*] --> New: RTCPeerConnection created
+  New --> Connecting: add tracks negotiate SDP
   Connecting --> Connected: ICE pair selected
-  Connected --> Disconnected: Network drop
+  Connected --> Disconnected: network drop
   Connected --> Failed: ICE failure
-  Disconnected --> Connected: ICE restart succeeds
-  Disconnected --> Failed: Restart times out
-  Connected --> Closed: peer-left / leave room
-  Failed --> Closed: pc.close()
+  Disconnected --> Connected: ICE restart OK
+  Disconnected --> Failed: ICE restart timeout
+  Connected --> Closed: peer left or room exit
+  Failed --> Closed: pc.close
   Closed --> [*]
 ```
 
