@@ -57,7 +57,33 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
   const typingDebounceRef = useRef<NodeJS.Timeout | null>(null);
   const openRef = useRef(open);
   const userNameInit = useRef(false);
+  const connectGenRef = useRef(0);
+  const recentMsgKeysRef = useRef<string[]>([]);
+  const userNameRef = useRef(userName);
   openRef.current = open;
+  userNameRef.current = userName;
+
+  const appendLog = useCallback(
+    (entry: { type: "message" | "typing" | "image"; name?: string; text?: string; image?: string; time?: string }) => {
+      if (entry.type === "message") {
+        const key = `m:${entry.name}:${entry.text}`;
+        if (recentMsgKeysRef.current.includes(key)) return;
+        recentMsgKeysRef.current.push(key);
+        if (recentMsgKeysRef.current.length > 80) {
+          recentMsgKeysRef.current = recentMsgKeysRef.current.slice(-40);
+        }
+      }
+      if (entry.type === "image") {
+        const key = `i:${entry.name}:${entry.image?.slice(0, 80)}`;
+        if (recentMsgKeysRef.current.includes(key)) return;
+        recentMsgKeysRef.current.push(key);
+      }
+      setLogs((prev) => [...prev, entry]);
+      if (!openRef.current) setHasNew(true);
+      setTimeout(() => logEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+    },
+    []
+  );
 
   useEffect(() => {
     if (!userNameInit.current && typeof window !== "undefined") {
@@ -69,18 +95,29 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
   const connect = useCallback(() => {
     if (!wsUrl || typeof window === "undefined") return;
     if (wsRef.current?.readyState === 1) return;
+
+    const gen = ++connectGenRef.current;
+
     if (wsRef.current) {
+      wsRef.current.onclose = null;
       wsRef.current.close();
       wsRef.current = null;
     }
+
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
+
     ws.onclose = () => {
       setReady(false);
-      wsRef.current = null;
-      setTimeout(connect, 1000);
+      if (wsRef.current === ws) wsRef.current = null;
+      if (connectGenRef.current !== gen) return;
+      setTimeout(() => {
+        if (connectGenRef.current === gen && wsUrl) connect();
+      }, 1000);
     };
-    ws.onopen = () => setReady(true);
+    ws.onopen = () => {
+      if (connectGenRef.current === gen) setReady(true);
+    };
     ws.onmessage = (e) => {
       const raw = e.data as string;
       
@@ -89,7 +126,7 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
         
         // Handle typing messages separately
         if (d && d.type === "typing" && typeof d.n === "string") {
-          if (d.n !== userName) {
+          if (d.n !== userNameRef.current) {
             setTypingUsers((prev) => {
               const next = new Set(prev);
               next.add(d.n);
@@ -115,15 +152,13 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
             return next;
           });
           
-          setLogs((prev) => [...prev, {
+          appendLog({
             type: "image",
             name: d.n,
             image: d.url,
             text: "",
-            time: currentTime()
-          }]);
-          if (!openRef.current) setHasNew(true);
-          setTimeout(() => logEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+            time: currentTime(),
+          });
           return;
         }
         
@@ -136,39 +171,38 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
             return next;
           });
           
-          setLogs((prev) => [...prev, {
+          appendLog({
             type: "message",
             name: d.n,
             text: d.m,
             image: "",
-            time: currentTime()
-          }]);
-          if (!openRef.current) setHasNew(true);
-          setTimeout(() => logEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+            time: currentTime(),
+          });
           return;
         }
       } catch {
-        // Not valid JSON, treat as plain text (backward compat)
-        setLogs((prev) => [...prev, {
+        appendLog({
           type: "message",
           name: "Unknown",
           text: raw,
           image: "",
-          time: currentTime()
-        }]);
-        if (!openRef.current) setHasNew(true);
-        setTimeout(() => logEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+          time: currentTime(),
+        });
       }
     };
-  }, [wsUrl]);
+  }, [wsUrl, appendLog]);
 
   useEffect(() => {
-    if (wsUrl) connect();
+    if (!wsUrl) return;
+    connect();
     return () => {
+      connectGenRef.current += 1;
       if (wsRef.current) {
+        wsRef.current.onclose = null;
         wsRef.current.close();
         wsRef.current = null;
       }
+      setReady(false);
     };
   }, [wsUrl, connect]);
 
@@ -198,7 +232,15 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
     const reader = new FileReader();
     reader.onload = (e) => {
       const dataUrl = e.target?.result as string;
+      if (!dataUrl) return;
       wsRef.current?.send(JSON.stringify({ type: "image", n: userName, url: dataUrl }));
+      appendLog({
+        type: "image",
+        name: userName,
+        image: dataUrl,
+        text: "",
+        time: currentTime(),
+      });
     };
     reader.readAsDataURL(file);
   };
@@ -213,7 +255,17 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     if (typingDebounceRef.current) clearTimeout(typingDebounceRef.current);
     
-    wsRef.current.send(JSON.stringify({ n: userName, m: text }));
+    const payload = JSON.stringify({ n: userName, m: text });
+    wsRef.current.send(payload);
+
+    appendLog({
+      type: "message",
+      name: userName,
+      text,
+      image: "",
+      time: currentTime(),
+    });
+
     inp!.value = "";
   };
 

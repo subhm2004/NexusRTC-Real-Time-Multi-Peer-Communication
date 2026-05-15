@@ -1584,12 +1584,16 @@ a:hover {
 .room-id-pill {
   font-size: 0.8rem;
   font-weight: 600;
-  font-family: ui-monospace, monospace;
+  font-family: inherit;
   padding: 0.35rem 0.75rem;
   border-radius: var(--radius-full);
   background: var(--bg-muted);
   border: 1px solid var(--border);
-  color: var(--text-muted);
+  color: var(--text);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .room-viewer-badge {
@@ -1740,6 +1744,87 @@ a:hover {
   border: 1px solid rgba(239, 68, 68, 0.35);
 }
 
+/* Video layout modes */
+.video-grid--layout-grid {
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+
+.video-grid--layout-spotlight.video-grid--has-primary {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-template-rows: minmax(320px, 1fr) auto;
+  gap: 0.75rem;
+  min-height: min(70vh, 720px);
+}
+.video-grid--layout-spotlight.video-grid--has-primary .video-tile--primary {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  aspect-ratio: auto;
+  min-height: min(50vh, 480px);
+  max-height: 70vh;
+}
+.video-grid--layout-spotlight.video-grid--has-primary .video-tile:not(.video-tile--primary) {
+  grid-row: 2;
+  aspect-ratio: 16 / 10;
+  min-height: 100px;
+  max-height: 150px;
+}
+
+.video-grid--layout-sidebar.video-grid--has-primary {
+  display: grid;
+  grid-template-columns: 1fr minmax(140px, 200px);
+  grid-template-rows: repeat(auto-fill, minmax(100px, 1fr));
+  gap: 0.65rem;
+  min-height: min(70vh, 720px);
+}
+.video-grid--layout-sidebar.video-grid--has-primary .video-tile--primary {
+  grid-column: 1;
+  grid-row: 1 / -1;
+  aspect-ratio: auto;
+  min-height: min(60vh, 600px);
+}
+.video-grid--layout-sidebar.video-grid--has-primary .video-tile:not(.video-tile--primary) {
+  grid-column: 2;
+  aspect-ratio: 16 / 10;
+  min-height: 90px;
+  max-height: 130px;
+}
+
+.video-tile--hand-raised {
+  box-shadow: 0 0 0 2px var(--accent), var(--shadow-lg);
+}
+.video-tile-hand {
+  position: absolute;
+  top: 0.65rem;
+  left: 0.65rem;
+  z-index: 4;
+  font-size: 1.35rem;
+  line-height: 1;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));
+  animation: hand-bounce 1.2s ease-in-out infinite;
+}
+@keyframes hand-bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+
+.room-hands-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.65rem 1rem;
+  margin: 0 0 0.25rem;
+  border-radius: var(--radius-lg);
+  background: var(--accent-muted);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  color: var(--text);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+.room-hands-banner-icon {
+  font-size: 1.25rem;
+}
+
 .room-controls-dock {
   position: fixed;
   bottom: 1.25rem;
@@ -1747,7 +1832,7 @@ a:hover {
   transform: translateX(-50%);
   z-index: 45;
   width: calc(100% - 2rem);
-  max-width: 520px;
+  max-width: 680px;
 }
 
 .room-controls-inner {
@@ -1769,39 +1854,129 @@ a:hover {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0.15rem;
-  min-width: 3.25rem;
-  padding: 0.5rem 0.4rem;
+  gap: 0.2rem;
+  min-width: 3.5rem;
+  padding: 0.35rem 0.5rem;
+  border: none;
+  border-radius: var(--radius-lg);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.2s var(--ease), color 0.2s var(--ease), transform 0.15s var(--ease), box-shadow 0.2s var(--ease);
+}
+.room-ctrl-btn--round .room-ctrl-icon {
+  width: 2.75rem;
+  height: 2.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--bg-muted);
+  border: 1px solid var(--border);
+  transition: background 0.2s var(--ease), border-color 0.2s var(--ease), color 0.2s var(--ease);
+}
+.room-ctrl-btn--round .room-ctrl-icon svg {
+  width: 1.25rem;
+  height: 1.25rem;
+}
+.room-ctrl-label {
+  font-size: 0.62rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+.room-ctrl-btn:hover .room-ctrl-icon {
+  background: var(--bg-soft);
+  border-color: var(--border-strong);
+}
+.room-ctrl-btn:active {
+  transform: scale(0.96);
+}
+.room-ctrl-btn.is-off .room-ctrl-icon {
+  background: var(--danger-muted);
+  border-color: rgba(239, 68, 68, 0.4);
+  color: var(--danger-text);
+}
+.room-ctrl-btn.is-off .room-ctrl-label {
+  color: var(--danger-text);
+}
+.room-ctrl-btn.is-active .room-ctrl-icon {
+  background: var(--accent-muted);
+  border-color: rgba(245, 158, 11, 0.45);
+  color: var(--accent);
+}
+.room-ctrl-btn.is-hand-raised .room-ctrl-icon {
+  background: var(--accent-muted);
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+.room-ctrl-btn.is-recording .room-ctrl-icon {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+  animation: recording-pulse 1.5s ease-in-out infinite;
+}
+.room-ctrl-btn.is-recording .room-ctrl-label {
+  color: var(--danger-text);
+}
+
+.room-controls-divider {
+  width: 1px;
+  height: 2.25rem;
+  background: var(--border);
+  margin: 0 0.15rem;
+  flex-shrink: 0;
+}
+
+.room-layout-picker {
+  position: relative;
+}
+.room-layout-menu {
+  position: absolute;
+  bottom: calc(100% + 0.5rem);
+  right: 0;
+  min-width: 200px;
+  margin: 0;
+  padding: 0.35rem;
+  list-style: none;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  z-index: 50;
+}
+.room-layout-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  width: 100%;
+  padding: 0.55rem 0.65rem;
   border: none;
   border-radius: var(--radius);
   background: transparent;
   color: var(--text);
   cursor: pointer;
   font-family: inherit;
-  font-size: 0.65rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  transition: background 0.2s var(--ease), color 0.2s var(--ease), transform 0.15s var(--ease);
+  text-align: left;
+  transition: background 0.15s var(--ease);
 }
-.room-ctrl-btn:hover {
+.room-layout-option:hover {
   background: var(--bg-muted);
 }
-.room-ctrl-btn:active {
-  transform: scale(0.95);
-}
-.room-ctrl-btn.is-off {
-  background: var(--danger-muted);
-  color: var(--danger-text);
-}
-.room-ctrl-btn.is-active {
+.room-layout-option.is-selected {
   background: var(--accent-muted);
-  color: var(--accent);
 }
-.room-ctrl-btn.is-recording {
-  background: var(--danger);
-  color: #fff;
-  animation: recording-pulse 1.5s ease-in-out infinite;
+.room-layout-option-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.room-layout-option-hint {
+  font-size: 0.72rem;
+  color: var(--text-muted);
 }
 
 .room-controls-user {
@@ -1846,6 +2021,91 @@ a:hover {
 .name-modal-room .name-modal-icon svg {
   width: 1.5rem;
   height: 1.5rem;
+}
+
+.create-room-main {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 5rem);
+  padding: 2rem 1.5rem;
+}
+
+.create-room-card {
+  position: relative;
+  max-width: 440px;
+  width: 100%;
+  margin: 0 auto;
+  animation: modalSlideIn 0.3s var(--ease);
+}
+
+.create-room-back {
+  display: block;
+  text-align: center;
+  margin-top: 1.25rem;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+.create-room-back:hover {
+  color: var(--accent);
+}
+
+.room-auth-loading {
+  min-height: 60vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.room-not-found {
+  text-align: center;
+  padding: 2rem;
+  max-width: 420px;
+  margin: 4rem auto;
+}
+.room-not-found h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.35rem;
+}
+.room-not-found p {
+  margin: 0 0 1.25rem;
+  color: var(--text-muted);
+}
+
+.create-room-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.75rem;
+  justify-content: center;
+  margin-bottom: 1.25rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.create-step {
+  color: var(--text-soft);
+}
+.create-step.active {
+  color: var(--accent);
+}
+.create-step.done {
+  color: var(--success);
+}
+.create-step.muted {
+  opacity: 0.65;
+}
+
+.create-room-actions {
+  display: flex;
+  gap: 0.65rem;
+  margin-top: 0.25rem;
+}
+.create-room-actions .name-modal-btn {
+  flex: 1;
+  margin-top: 0;
+}
+.create-room-actions .btn-ghost {
+  flex-shrink: 0;
 }
 
 /* --- Footer --- */

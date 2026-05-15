@@ -62,7 +62,7 @@ export default function WelcomePage() {
                   <path d="M5 12h14M12 5l7 7-7 7" />
                 </svg>
               </Link>
-              <span className="landing-cta-hint">Free · No account · Works on Chrome, Firefox, Safari</span>
+              <span className="landing-cta-hint">Password-protected rooms · No account · Chrome, Firefox, Safari</span>
             </div>
             <div className="landing-stats">
               <div className="landing-stat">

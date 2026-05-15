@@ -1,9 +1,18 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  getStoredCreatorToken,
+  getStoredSessionToken,
+  setStoredSessionToken,
+  wsUrlWithToken,
+} from "@/lib/room-auth";
 import { Chat } from "./Chat";
+import { RoomControlsDock, type VideoLayoutMode } from "./room/RoomControlsDock";
 import { ThemeToggle } from "./ThemeToggle";
+
+const VIDEO_LAYOUT_KEY = "nexus-video-layout";
 
 function RemoteVideo({ stream }: { stream: MediaStream }) {
   const ref = useRef<HTMLVideoElement>(null);
@@ -199,22 +208,125 @@ async function createMeetingCompositeStream(
   return { stream: compositeStream, cleanup };
 }
 
-function NameInputModal({ onJoin }: { onJoin: (name: string) => void }) {
+function PasswordModal({
+  roomId,
+  roomName,
+  onSuccess,
+}: {
+  roomId: string;
+  roomName?: string | null;
+  onSuccess: (sessionToken: string) => void;
+}) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setTimeout(() => inputRef.current?.focus(), 100);
+  }, []);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = password.trim();
+    if (trimmed.length < 4) {
+      setError("Enter the room password (at least 4 characters)");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const res = await fetch("/api/room/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ roomId, password: trimmed }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (res.status === 404) {
+          setError(
+            "Room not found on the server. If the host restarted the app, ask them to create a new room."
+          );
+        } else if (res.status === 401) {
+          setError("Incorrect password. Try again.");
+        } else {
+          setError(data.error || "Could not verify password");
+        }
+        return;
+      }
+      setStoredSessionToken(roomId, data.sessionToken);
+      onSuccess(data.sessionToken);
+    } catch {
+      setError("Could not verify password. Try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="name-modal-overlay">
+      <div className="name-modal name-modal-room">
+        <div className="name-modal-icon" aria-hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <rect x="3" y="11" width="18" height="11" rx="2" />
+            <path d="M7 11V7a5 5 0 0110 0v4" />
+          </svg>
+        </div>
+        <h2 className="name-modal-title">
+          {roomName ? `Join "${roomName}"` : "Room password required"}
+        </h2>
+        <p className="name-modal-subtitle">
+          This room is protected. Ask the host for the password to join.
+        </p>
+        <form onSubmit={handleSubmit}>
+          <input
+            ref={inputRef}
+            type="password"
+            className="name-modal-input"
+            placeholder="Room password"
+            value={password}
+            onChange={(e) => {
+              setPassword(e.target.value);
+              setError("");
+            }}
+            maxLength={64}
+            autoComplete="current-password"
+          />
+          {error && <div className="name-modal-error">{error}</div>}
+          <button type="submit" className="btn btn-primary name-modal-btn" disabled={loading}>
+            {loading ? "Verifying…" : "Continue"}
+          </button>
+        </form>
+        <Link href="/" className="create-room-back">
+          Back to home
+        </Link>
+      </div>
+    </div>
+  );
+}
+
+function NameInputModal({
+  onJoin,
+  isHost,
+  roomName,
+}: {
+  onJoin: (name: string) => void;
+  isHost?: boolean;
+  roomName?: string | null;
+}) {
   const [name, setName] = useState("");
   const [error, setError] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    // Check if name already exists in localStorage
-    if (typeof window !== "undefined") {
+    if (!isHost && typeof window !== "undefined") {
       const stored = localStorage.getItem(CHAT_NAME_KEY);
       if (stored?.trim()) {
         setName(stored.trim());
       }
     }
-    // Focus input
     setTimeout(() => inputRef.current?.focus(), 100);
-  }, []);
+  }, [isHost]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -242,14 +354,20 @@ function NameInputModal({ onJoin }: { onJoin: (name: string) => void }) {
             <path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
           </svg>
         </div>
-        <h2 className="name-modal-title">Join the room</h2>
-        <p className="name-modal-subtitle">Pick a display name — friends will see this on your video tile</p>
+        <h2 className="name-modal-title">
+          {isHost ? "Enter your name as host" : roomName ? `Join "${roomName}"` : "Join the room"}
+        </h2>
+        <p className="name-modal-subtitle">
+          {isHost
+            ? "This is how others will see you in the meeting you just created."
+            : "Pick a display name — friends will see this on your video tile"}
+        </p>
         <form onSubmit={handleSubmit}>
           <input
             ref={inputRef}
             type="text"
             className="name-modal-input"
-            placeholder="Your name"
+            placeholder={isHost ? "Host name" : "Your name"}
             value={name}
             onChange={(e) => {
               setName(e.target.value);
@@ -260,7 +378,7 @@ function NameInputModal({ onJoin }: { onJoin: (name: string) => void }) {
           />
           {error && <div className="name-modal-error">{error}</div>}
           <button type="submit" className="btn btn-primary name-modal-btn">
-            Join Room
+            {isHost ? "Start meeting" : "Join room"}
           </button>
         </form>
       </div>
@@ -270,6 +388,10 @@ function NameInputModal({ onJoin }: { onJoin: (name: string) => void }) {
 
 export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string }) {
   const [wsBase, setWsBase] = useState("");
+  const [authState, setAuthState] = useState<"loading" | "notfound" | "password" | "ready">("loading");
+  const [sessionToken, setSessionToken] = useState<string | null>(null);
+  const [roomDisplayName, setRoomDisplayName] = useState<string | null>(null);
+  const [isHostJoin, setIsHostJoin] = useState(false);
   const [noPerm, setNoPerm] = useState(false);
   const [connClosed, setConnClosed] = useState(false);
   const [viewerCount, setViewerCount] = useState("0");
@@ -282,6 +404,9 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
   const [isRecording, setIsRecording] = useState(false);
   const [recordingStatus, setRecordingStatus] = useState<"idle" | "uploading" | "saved" | "error">("idle");
   const [recordingPeer, setRecordingPeer] = useState<{ id: string; name: string } | null>(null);
+  const [videoLayout, setVideoLayout] = useState<VideoLayoutMode>("auto");
+  const [raisedHands, setRaisedHands] = useState<Record<string, boolean>>({});
+  const [isHandRaised, setIsHandRaised] = useState(false);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -304,17 +429,99 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
     setWsBase(getWsBase());
   }, []);
 
-  const roomWsUrl = wsBase ? `${wsBase}/room/${uuid}/websocket` : "";
-  const chatWsUrl = wsBase ? `${wsBase}/room/${uuid}/chat/websocket` : "";
-  const viewerWsUrl = wsBase ? `${wsBase}/room/${uuid}/viewer/websocket` : "";
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const stored = localStorage.getItem(VIDEO_LAYOUT_KEY);
+    if (stored === "auto" || stored === "grid" || stored === "spotlight" || stored === "sidebar") {
+      setVideoLayout(stored);
+    }
+  }, []);
+
+  const handleLayoutChange = useCallback((layout: VideoLayoutMode) => {
+    setVideoLayout(layout);
+    if (typeof window !== "undefined") {
+      localStorage.setItem(VIDEO_LAYOUT_KEY, layout);
+    }
+  }, []);
+
+  const roomWsUrl = wsBase
+    ? wsUrlWithToken(`${wsBase}/room/${uuid}/websocket`, sessionToken)
+    : "";
+  const chatWsUrl = wsBase
+    ? wsUrlWithToken(`${wsBase}/room/${uuid}/chat/websocket`, sessionToken)
+    : "";
+  const viewerWsUrl = wsBase
+    ? wsUrlWithToken(`${wsBase}/room/${uuid}/viewer/websocket`, sessionToken)
+    : "";
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function initAuth() {
+      try {
+        const statusRes = await fetch(`/api/room/${uuid}/status`);
+        const status = await statusRes.json();
+        if (!status.exists) {
+          if (!cancelled) setAuthState("notfound");
+          return;
+        }
+
+        if (!cancelled && status.roomName) {
+          setRoomDisplayName(status.roomName);
+        }
+
+        const stored = getStoredSessionToken(uuid);
+        const creatorToken = getStoredCreatorToken(uuid);
+
+        if (stored) {
+          if (!cancelled) {
+            setSessionToken(stored);
+            setIsHostJoin(!!creatorToken);
+            setAuthState("ready");
+          }
+          return;
+        }
+
+        if (creatorToken) {
+          const verifyRes = await fetch("/api/room/verify", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ roomId: uuid, creatorToken }),
+          });
+          if (verifyRes.ok) {
+            const data = await verifyRes.json();
+            setStoredSessionToken(uuid, data.sessionToken);
+            if (!cancelled) {
+              setSessionToken(data.sessionToken);
+              setIsHostJoin(true);
+              setAuthState("ready");
+            }
+            return;
+          }
+        }
+
+        if (!cancelled) setAuthState("password");
+      } catch {
+        if (!cancelled) setAuthState("password");
+      }
+    }
+
+    initAuth();
+    return () => {
+      cancelled = true;
+    };
+  }, [uuid]);
 
   const copy = (text: string) => {
     navigator.clipboard?.writeText(text).then(() => {});
   };
 
-  const send = useCallback((msg: { to?: string; event: string; data?: string; name?: string }) => {
-    if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify(msg));
-  }, []);
+  const send = useCallback(
+    (msg: { to?: string; event: string; data?: string; name?: string; raised?: boolean }) => {
+      if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify(msg));
+    },
+    []
+  );
 
   const flushCandidates = useCallback((peerId: string, pc: RTCPeerConnection) => {
     const q = candidateQueueRef.current.get(peerId);
@@ -425,16 +632,18 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
         // Store peer names from the joined message
         if (msg.peers && Array.isArray(msg.peers)) {
           const names: Record<string, string> = {};
-          msg.peers.forEach((p: { id: string; name?: string } | string) => {
+          const hands: Record<string, boolean> = {};
+          msg.peers.forEach((p: { id: string; name?: string; handRaised?: boolean } | string) => {
             if (typeof p === 'object' && p.id) {
               names[p.id] = p.name || `Peer ${p.id.slice(0, 4)}`;
+              if (p.handRaised) hands[p.id] = true;
               createOfferTo(p.id, activeStream);
             } else if (typeof p === 'string') {
-              // Backward compatibility
               createOfferTo(p, activeStream);
             }
           });
           setPeerNames(names);
+          setRaisedHands((prev) => ({ ...prev, ...hands }));
         } else {
           // Backward compatibility
           (msg.peers || []).forEach((p: string) => createOfferTo(p, activeStream));
@@ -494,7 +703,21 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
           delete n[msg.peerId];
           return n;
         });
+        setRaisedHands((prev) => {
+          const n = { ...prev };
+          delete n[msg.peerId];
+          return n;
+        });
         setRecordingPeer((prev) => (prev?.id === msg.peerId ? null : prev));
+        return;
+      }
+      if (msg.event === "hand-raised" && msg.peerId) {
+        setRaisedHands((prev) => {
+          const next = { ...prev };
+          if (msg.raised) next[msg.peerId] = true;
+          else delete next[msg.peerId];
+          return next;
+        });
         return;
       }
       if (msg.event === "recording-started") {
@@ -648,6 +871,53 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
   const hasPeers = remoteCount > 0;
   const participantCount = 1 + remoteCount;
   const gridSizeClass = `video-grid--count-${Math.min(participantCount, 6)}`;
+  const layoutMode = videoLayout === "auto" ? "auto" : videoLayout;
+  const remoteIds = Object.keys(remoteStreams);
+  const primaryPeerId =
+    (layoutMode === "spotlight" || layoutMode === "sidebar") && remoteIds.length > 0
+      ? remoteIds[0]
+      : null;
+
+  const toggleHandRaise = useCallback(() => {
+    const next = !isHandRaised;
+    setIsHandRaised(next);
+    const myId = myIdRef.current;
+    if (myId) {
+      setRaisedHands((prev) => {
+        const updated = { ...prev };
+        if (next) updated[myId] = true;
+        else delete updated[myId];
+        return updated;
+      });
+    }
+    send({ event: "hand-raise", raised: next });
+  }, [isHandRaised, send]);
+
+  const raisedHandNames = useMemo(() => {
+    const names: string[] = [];
+    const myId = myIdRef.current;
+    if (isHandRaised && userName) names.push(userName);
+    Object.entries(raisedHands).forEach(([id, up]) => {
+      if (!up || id === myId) return;
+      names.push(peerNames[id] || `Peer ${id.slice(0, 4)}`);
+    });
+    return names;
+  }, [raisedHands, isHandRaised, userName, peerNames]);
+
+  const videoGridClass = [
+    "video-grid",
+    gridSizeClass,
+    `video-grid--layout-${layoutMode}`,
+    primaryPeerId ? "video-grid--has-primary" : "",
+  ].join(" ");
+
+  const orderedRemoteIds = useMemo(() => {
+    if (!primaryPeerId) return remoteIds;
+    return [primaryPeerId, ...remoteIds.filter((id) => id !== primaryPeerId)];
+  }, [remoteIds, primaryPeerId]);
+
+  const useFocusLayout = layoutMode === "spotlight" || layoutMode === "sidebar";
+  const localHandUp = isHandRaised || !!(myIdRef.current && raisedHands[myIdRef.current]);
 
   // Toggle audio mute/unmute
   const toggleMute = useCallback(() => {
@@ -1015,9 +1285,49 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
     };
   }, []);
 
-  // Show name input modal if name not set
+  if (authState === "loading") {
+    return (
+      <div className="loading-wrap room-auth-loading">
+        <p>Checking room…</p>
+      </div>
+    );
+  }
+
+  if (authState === "notfound") {
+    return (
+      <div className="app-wrap">
+        <div className="notif notif-danger room-not-found">
+          <h2>Room not found</h2>
+          <p>This room does not exist or was never created. Ask the host for a new link.</p>
+          <Link href="/room/create" className="btn btn-primary btn-sm">
+            Create a room
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (authState === "password") {
+    return (
+      <PasswordModal
+        roomId={uuid}
+        roomName={roomDisplayName}
+        onSuccess={(token) => {
+          setSessionToken(token);
+          setAuthState("ready");
+        }}
+      />
+    );
+  }
+
   if (!userName) {
-    return <NameInputModal onJoin={(name) => setUserName(name)} />;
+    return (
+      <NameInputModal
+        isHost={isHostJoin}
+        roomName={roomDisplayName}
+        onJoin={(name) => setUserName(name)}
+      />
+    );
   }
 
   return (
@@ -1037,8 +1347,8 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
           NexusRTC
         </Link>
         <div className="room-nav-meta">
-          <span className="room-id-pill" title={uuid}>
-            Room · {uuid.slice(0, 8)}
+          <span className="room-id-pill" title={roomDisplayName ? `${roomDisplayName} (${uuid})` : uuid}>
+            {roomDisplayName || `Room · ${uuid.slice(0, 8)}`}
           </span>
           <span className="viewer-badge room-viewer-badge">
             <span className="viewer-badge-dot" />
@@ -1070,10 +1380,34 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
         </div>
       )}
 
+      {raisedHandNames.length > 0 && (
+        <div className="room-hands-banner" role="status">
+          <span className="room-hands-banner-icon" aria-hidden>✋</span>
+          <span>
+            {raisedHandNames.length === 1
+              ? `${raisedHandNames[0]} raised their hand`
+              : `${raisedHandNames.join(", ")} raised their hands`}
+          </span>
+        </div>
+      )}
+
       {!noPerm && (
         <div className="room-stage" id="peers">
-          <div className={`video-grid ${gridSizeClass}`} id="videos">
-            <div className="video-tile you">
+          <div className={videoGridClass} id="videos">
+            {useFocusLayout && primaryPeerId && (() => {
+              const stream = remoteStreams[primaryPeerId];
+              if (!stream?.getTracks().length) return null;
+              const handUp = !!raisedHands[primaryPeerId];
+              const peerName = peerNames[primaryPeerId] || `Peer ${primaryPeerId.slice(0, 4)}`;
+              return (
+                <div key={primaryPeerId} className={`video-tile video-tile--primary ${handUp ? "video-tile--hand-raised" : ""}`}>
+                  <RemoteVideo stream={stream} />
+                  {handUp && <span className="video-tile-hand" title="Hand raised">✋</span>}
+                  <span className="video-tile-label">{peerName}</span>
+                </div>
+              );
+            })()}
+            <div className={`video-tile you ${useFocusLayout && !primaryPeerId ? "video-tile--primary" : ""} ${localHandUp ? "video-tile--hand-raised" : ""}`}>
               <video ref={localVideoRef} className={isScreenSharing ? '' : 'mirror'} autoPlay muted playsInline style={{ opacity: isVideoEnabled || isScreenSharing ? 1 : 0.3 }} />
               {!isVideoEnabled && (
                 <div className="video-placeholder">
@@ -1085,88 +1419,8 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
                   <span>Camera Off</span>
                 </div>
               )}
+              {localHandUp && <span className="video-tile-hand" title="Hand raised">✋</span>}
               <span className="video-tile-label">{userName}</span>
-              <div className="video-controls video-controls--hidden">
-                <button
-                  type="button"
-                  className={`video-control-btn ${isMuted ? 'active' : ''}`}
-                  onClick={toggleMute}
-                  title={isMuted ? 'Unmute' : 'Mute'}
-                  aria-label={isMuted ? 'Unmute microphone' : 'Mute microphone'}
-                >
-                  {isMuted ? (
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M12 1L8 5H4a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h4l4 4V1z" />
-                      <line x1="23" y1="1" x2="1" y2="23" />
-                    </svg>
-                  ) : (
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M12 1L8 5H4a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h4l4 4V1z" />
-                      <path d="M19 10a2 2 0 0 0-2-2m-2 4a2 2 0 0 0 2 2m2-4a2 2 0 0 1 2 2m-2-4v4m0-4a2 2 0 0 0-2-2" />
-                    </svg>
-                  )}
-                </button>
-                <button
-                  type="button"
-                  className={`video-control-btn ${!isVideoEnabled ? 'active' : ''}`}
-                  onClick={toggleVideo}
-                  title={isVideoEnabled ? 'Turn off video' : 'Turn on video'}
-                  aria-label={isVideoEnabled ? 'Turn off camera' : 'Turn on camera'}
-                >
-                  {isVideoEnabled ? (
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M23 7l-7 5 7 5V7z" />
-                      <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-                    </svg>
-                  ) : (
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M23 7l-7 5 7 5V7z" />
-                      <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-                      <line x1="1" y1="1" x2="16" y2="16" />
-                    </svg>
-                  )}
-                </button>
-                <button
-                  type="button"
-                  className={`video-control-btn ${isScreenSharing ? 'active' : ''}`}
-                  onClick={isScreenSharing ? stopScreenShare : startScreenShare}
-                  title={isScreenSharing ? 'Stop sharing screen' : 'Share screen'}
-                  aria-label={isScreenSharing ? 'Stop sharing screen' : 'Share screen'}
-                >
-                  {isScreenSharing ? (
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
-                      <line x1="8" y1="21" x2="16" y2="21" />
-                      <line x1="12" y1="17" x2="12" y2="21" />
-                      <path d="M7 13l5 5 5-5" />
-                    </svg>
-                  ) : (
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
-                      <line x1="8" y1="21" x2="16" y2="21" />
-                      <line x1="12" y1="17" x2="12" y2="21" />
-                    </svg>
-                  )}
-                </button>
-                <button
-                  type="button"
-                  className={`video-control-btn ${isRecording ? 'recording' : ''}`}
-                  onClick={isRecording ? stopRecording : startRecording}
-                  title={isRecording ? 'Stop recording' : 'Start recording'}
-                  aria-label={isRecording ? 'Stop recording' : 'Start recording'}
-                >
-                  {isRecording ? (
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-                      <rect x="6" y="6" width="12" height="12" rx="2" />
-                    </svg>
-                  ) : (
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <circle cx="12" cy="12" r="10" />
-                      <circle cx="12" cy="12" r="3" fill="currentColor" />
-                    </svg>
-                  )}
-                </button>
-              </div>
               {isScreenSharing && (
                 <div className="screen-share-indicator">
                   <span>Sharing Screen</span>
@@ -1184,27 +1438,21 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
                 Connection closed. Please refresh the page.
               </div>
             )}
-            {Object.entries(remoteStreams).map(([peerId, stream]) => {
-              const trackCount = stream.getTracks().length;
-              const videoTracks = stream.getVideoTracks().length;
-              const audioTracks = stream.getAudioTracks().length;
-              
-              console.log(`Rendering peer ${peerId}: ${trackCount} total tracks (${videoTracks} video, ${audioTracks} audio)`);
-              
-              if (trackCount === 0) {
-                console.log(`Skipping peer ${peerId} - no tracks`);
-                return null;
-              }
-              
-              const peerName = peerNames[peerId] || `Peer ${peerId.slice(0, 4)}`;
-              
-              return (
-                <div key={peerId} className="video-tile">
-                  <RemoteVideo stream={stream} />
-                  <span className="video-tile-label">{peerName}</span>
-                </div>
-              );
-            })}
+            {orderedRemoteIds
+              .filter((peerId) => !(useFocusLayout && primaryPeerId && peerId === primaryPeerId))
+              .map((peerId) => {
+                const stream = remoteStreams[peerId];
+                if (!stream?.getTracks().length) return null;
+                const handUp = !!raisedHands[peerId];
+                const peerName = peerNames[peerId] || `Peer ${peerId.slice(0, 4)}`;
+                return (
+                  <div key={peerId} className={`video-tile ${handUp ? "video-tile--hand-raised" : ""}`}>
+                    <RemoteVideo stream={stream} />
+                    {handUp && <span className="video-tile-hand" title="Hand raised">✋</span>}
+                    <span className="video-tile-label">{peerName}</span>
+                  </div>
+                );
+              })}
           </div>
           {!hasPeers && !connClosed && (
             <aside className="room-empty-panel">
@@ -1224,77 +1472,21 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
       )}
 
       {!noPerm && (
-        <div className="room-controls-dock">
-          <div className="room-controls-inner">
-            <button
-              type="button"
-              className={`room-ctrl-btn ${isMuted ? "is-off" : ""}`}
-              onClick={toggleMute}
-              title={isMuted ? "Unmute" : "Mute"}
-              aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
-            >
-              {isMuted ? (
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M12 1L8 5H4a2 2 0 00-2 2v6a2 2 0 002 2h4l4 4V1z" />
-                  <line x1="23" y1="1" x2="1" y2="23" />
-                </svg>
-              ) : (
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M12 1L8 5H4a2 2 0 00-2 2v6a2 2 0 002 2h4l4 4V1z" />
-                </svg>
-              )}
-              <span>Mic</span>
-            </button>
-            <button
-              type="button"
-              className={`room-ctrl-btn ${!isVideoEnabled ? "is-off" : ""}`}
-              onClick={toggleVideo}
-              title={isVideoEnabled ? "Turn off camera" : "Turn on camera"}
-              aria-label={isVideoEnabled ? "Turn off camera" : "Turn on camera"}
-            >
-              {isVideoEnabled ? (
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M23 7l-7 5 7 5V7z" />
-                  <rect x="1" y="5" width="15" height="14" rx="2" />
-                </svg>
-              ) : (
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M23 7l-7 5 7 5V7z" />
-                  <rect x="1" y="5" width="15" height="14" rx="2" />
-                  <line x1="1" y1="1" x2="16" y2="16" />
-                </svg>
-              )}
-              <span>Cam</span>
-            </button>
-            <button
-              type="button"
-              className={`room-ctrl-btn ${isScreenSharing ? "is-active" : ""}`}
-              onClick={isScreenSharing ? stopScreenShare : startScreenShare}
-              title={isScreenSharing ? "Stop sharing" : "Share screen"}
-              aria-label={isScreenSharing ? "Stop sharing screen" : "Share screen"}
-            >
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <rect x="2" y="3" width="20" height="14" rx="2" />
-                <path d="M8 21h8M12 17v4" />
-              </svg>
-              <span>Share</span>
-            </button>
-            <button
-              type="button"
-              className={`room-ctrl-btn ${isRecording ? "is-recording" : ""}`}
-              onClick={isRecording ? stopRecording : startRecording}
-              title={isRecording ? "Stop recording" : "Record"}
-              aria-label={isRecording ? "Stop recording" : "Start recording"}
-            >
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="12" cy="12" r="10" />
-                <circle cx="12" cy="12" r="3" fill="currentColor" />
-              </svg>
-              <span>Rec</span>
-            </button>
-            <span className="room-controls-user">{userName}</span>
-          </div>
-        </div>
+        <RoomControlsDock
+          userName={userName}
+          isMuted={isMuted}
+          isVideoEnabled={isVideoEnabled}
+          isScreenSharing={isScreenSharing}
+          isRecording={isRecording}
+          isHandRaised={isHandRaised}
+          videoLayout={videoLayout}
+          onToggleMute={toggleMute}
+          onToggleVideo={toggleVideo}
+          onToggleScreenShare={isScreenSharing ? stopScreenShare : startScreenShare}
+          onToggleRecording={isRecording ? stopRecording : startRecording}
+          onToggleHandRaise={toggleHandRaise}
+          onLayoutChange={handleLayoutChange}
+        />
       )}
       </main>
     </div>

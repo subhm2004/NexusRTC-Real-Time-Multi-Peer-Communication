@@ -3,8 +3,8 @@ const { parse } = require("url");
 const next = require("next");
 const { WebSocketServer } = require("ws");
 const {
-  getOrCreateRoom,
   getRoomByUuid,
+  validateSession,
   broadcastChat,
   startViewerCountInterval,
 } = require("./lib/room-state");
@@ -69,15 +69,34 @@ app.prepare().then(() => {
     });
   });
 
+  function getSessionToken(req) {
+    const { query } = parse(req.url || "", true);
+    const token = query.token;
+    return typeof token === "string" && token.length > 0 ? token : null;
+  }
+
+  function rejectUnauthorized(ws) {
+    try {
+      ws.close(4001, "Unauthorized");
+    } catch {
+      ws.close();
+    }
+  }
+
   wss.on("connection", (ws, req, r) => {
     const { type, id } = r;
+    const sessionToken = getSessionToken(req);
 
     if (type === "room") {
-      const room = getOrCreateRoom(id);
+      const room = getRoomByUuid(id);
+      if (!room || !validateSession(id, sessionToken)) {
+        rejectUnauthorized(ws);
+        return;
+      }
       const peerId = crypto.randomUUID();
       let peerName = null; // Will be set when client sends name
       let nameReceived = false;
-      room.peers.set(peerId, { ws, name: peerName, isViewer: false });
+      room.peers.set(peerId, { ws, name: peerName, isViewer: false, handRaised: false });
 
       // Function to notify existing peers about new peer (called after name is received)
       const notifyNewPeer = (name) => {
@@ -94,7 +113,11 @@ app.prepare().then(() => {
           peerId,
           peers: Array.from(room.peers.entries())
             .filter(([k]) => k !== peerId)
-            .map(([pid, p]) => ({ id: pid, name: p.name || `Peer ${pid.slice(0, 4)}` })),
+            .map(([pid, p]) => ({
+              id: pid,
+              name: p.name || `Peer ${pid.slice(0, 4)}`,
+              handRaised: !!p.handRaised,
+            })),
           viewer: false,
           recordingPeer: room.recordingPeer || null,
         })
@@ -132,6 +155,18 @@ app.prepare().then(() => {
           if (to && (event === "offer" || event === "answer" || event === "candidate")) {
             sendToPeer(room, to, { event, from: peerId, data });
           }
+          if (event === "hand-raise" && typeof msg.raised === "boolean") {
+            const peer = room.peers.get(peerId);
+            if (peer) {
+              peer.handRaised = msg.raised;
+              broadcastToRoomExcept(room, peerId, {
+                event: "hand-raised",
+                peerId,
+                raised: msg.raised,
+              });
+            }
+            return;
+          }
           if (event === "recording-started") {
             const displayName = name || peerName || `Peer ${peerId.slice(0, 4)}`;
             room.recordingPeer = { peerId, name: displayName };
@@ -166,24 +201,18 @@ app.prepare().then(() => {
 
     if (type === "roomChat") {
       const room = getRoomByUuid(id);
-      if (!room || !room.hub) {
-        ws.close();
+      if (!room || !room.hub || !validateSession(id, sessionToken)) {
+        rejectUnauthorized(ws);
         return;
       }
       room.hub.clients.add(ws);
       ws.on("message", (raw) => {
+        const payload = raw.toString();
         try {
-          const msg = JSON.parse(raw.toString());
-          // Handle typing and image messages
-          if (msg.type === "typing" || msg.type === "image") {
-            broadcastChat(room.hub, raw.toString());
-          } else {
-            // Regular chat message
-            broadcastChat(room.hub, raw.toString());
-          }
+          const msg = JSON.parse(payload);
+          broadcastChat(room.hub, payload, ws);
         } catch {
-          // Fallback for plain text
-          broadcastChat(room.hub, raw.toString());
+          broadcastChat(room.hub, payload, ws);
         }
       });
       ws.on("close", () => {
@@ -194,8 +223,8 @@ app.prepare().then(() => {
 
     if (type === "roomViewer") {
       const room = getRoomByUuid(id);
-      if (!room) {
-        ws.close();
+      if (!room || !validateSession(id, sessionToken)) {
+        rejectUnauthorized(ws);
         return;
       }
       room.viewerSockets.add(ws);
