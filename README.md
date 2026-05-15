@@ -2,17 +2,30 @@
 
 # NexusRTC
 
-**Real-time, peer-to-peer video conferencing — no sign-up, no accounts, one link to join.**
+<img
+  src="https://readme-typing-svg.demolab.com?font=Plus+Jakarta+Sans&weight=600&size=24&duration=2800&pause=900&color=F59E0B&center=true&vCenter=true&repeat=true&width=920&lines=Peer-to-peer+video+conferencing;No+sign-up%2C+one+link+to+join;Mesh+WebRTC+%C2%B7+Room+password+%C2%B7+Live+chat;Screen+share+%C2%B7+Recording+%C2%B7+Hand+raise"
+  alt="Peer-to-peer video conferencing — no sign-up, one link to join"
+/>
 
-Built with **WebRTC mesh**, **Next.js 14**, **React 18**, and a custom **Node.js WebSocket** signaling server in a single process.
+<br>
 
-[![Next.js](https://img.shields.io/badge/Next.js-14.2-black?logo=next.js)](https://nextjs.org/)
-[![React](https://img.shields.io/badge/React-18-61dafb?logo=react)](https://react.dev/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6?logo=typescript)](https://www.typescriptlang.org/)
-[![WebRTC](https://img.shields.io/badge/WebRTC-Mesh-ff69b4)](https://webrtc.org/)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ed?logo=Docker)](https://www.docker.com/)
+[![Next.js](https://img.shields.io/badge/Next.js-14.2-000000?style=flat&logo=next.js&logoColor=white)](https://nextjs.org/)
+[![React](https://img.shields.io/badge/React-18.3-61dafb?style=flat&logo=react&logoColor=white)](https://react.dev/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![WebRTC](https://img.shields.io/badge/WebRTC-Mesh-e91e63?style=flat)](https://webrtc.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-WebSocket-339933?style=flat&logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker&logoColor=white)](https://www.docker.com/)
+[![License](https://img.shields.io/badge/License-MIT-f59e0b?style=flat)](LICENSE)
 
-[Features](#features) · [Quick Start](#quick-start) · [Architecture](#architecture) · [Protocol](#websocket-protocol-reference) · [Deploy](#production-deployment)
+<br>
+
+<p>
+  <b>WebRTC</b> &nbsp;·&nbsp; <b>Mesh P2P</b> &nbsp;·&nbsp; <b>Room Password</b> &nbsp;·&nbsp; <b>Live Chat</b> &nbsp;·&nbsp; <b>Screen Share</b> &nbsp;·&nbsp; <b>Recording</b> &nbsp;·&nbsp; <b>Hand Raise</b> &nbsp;·&nbsp; <b>4 Layouts</b>
+</p>
+
+<br>
+
+[Features](#features) · [Quick Start](#quick-start) · [User Journey](#user-journey-end-to-end) · [Architecture](#architecture) · [Protocol](#websocket-protocol-reference) · [Deploy](#production-deployment)
 
 </div>
 
@@ -62,7 +75,7 @@ Built with **WebRTC mesh**, **Next.js 14**, **React 18**, and a custom **Node.js
 |--------|-------------------|
 | **Media path** | **Peer-to-peer (mesh)** — video/audio goes directly between browsers after setup |
 | **Server role** | **Signaling + chat + metadata only** — server never relays video |
-| **Auth** | **None** — room UUID in the URL is the “password” |
+| **Auth** | **Room password** (host sets at create) + session token for WebSockets |
 | **Database** | **None** — all room state lives in memory on the Node process |
 | **Deployment** | **Single long-running Node process** (not serverless) |
 
@@ -96,9 +109,9 @@ If **4 people** are in a room, **each browser** maintains **3** `RTCPeerConnecti
 - **STUN** (included): helps discover public IP through NAT — works for many home networks.
 - **TURN** (not included): relays media when P2P fails (corporate firewalls, symmetric NAT). You must add your own TURN server for hard networks.
 
-### 4. Room URL = secret
+### 4. Room link + password
 
-Anyone with `https://yoursite.com/room/<uuid>` can join. Use long random UUIDs (crypto-safe) — the app does this automatically via `/room/create`.
+Anyone with the room URL still needs the **password** the host set at creation (unless they are the host with a stored creator token). Room IDs are crypto-random UUIDs from `/room/create`. WebSocket connections require a **session token** from `POST /api/room/verify` or create flow.
 
 ---
 
@@ -111,7 +124,14 @@ Anyone with `https://yoursite.com/room/<uuid>` can join. Use long random UUIDs (
 - Echo cancellation on microphone.
 - Mute/unmute mic and camera from bottom control dock.
 - Local preview mirrored (self-view); remote peers not mirrored.
-- Dynamic video grid layout (1–6+ participants).
+- **4 video layouts** — Auto, Grid, Spotlight, Sidebar (saved in `localStorage`).
+- Dynamic grid sizing for 1–6+ participants.
+
+### In-call controls
+
+- **Floating control dock** — round icon buttons for Mic, Camera, Share, Record, Hand, Layout.
+- **Hand raise** — synced to all peers; ✋ badge on tiles + top banner.
+- **Layout picker** — switch view mode without leaving the call.
 
 ### Screen sharing
 
@@ -131,16 +151,23 @@ Anyone with `https://yoursite.com/room/<uuid>` can join. Use long random UUIDs (
 
 ### Chat
 
-- Dedicated WebSocket per room (separate from signaling).
+- Dedicated WebSocket per room (separate from signaling); requires session `?token=`.
 - Text messages, **typing indicators** (500ms debounce, 3s auto-clear).
-- Emoji picker.
-- Image paste/drag/upload as **base64 data URLs**.
+- Emoji picker; image paste/upload as **base64 data URLs**.
+- Optimistic send + dedupe (no duplicate messages on reconnect).
 - Unread dot when panel collapsed.
+
+### Room security
+
+- **Two-step create flow** — room name → password + confirm.
+- **Password gate** for guests before join (`POST /api/room/verify`).
+- **Session tokens** on all room WebSockets (signaling, chat, viewer).
+- Shared in-memory room store via `global.__NexusRTC_room_state__` (API + `server.js`).
 
 ### UX
 
 - Modern **landing page** (hero, features, how-it-works, CTA).
-- **Room page** with glass nav, room ID pill, live “in call” count, empty-state panel, floating controls.
+- **Room page** with glass nav, room name pill, live “in call” count, empty-state panel, polished control dock.
 - **Dark / light theme** — system preference + `localStorage`.
 - Name modal before join; name stored in `localStorage`.
 - One-click **Copy link**.
@@ -210,11 +237,15 @@ PORT=3001 npm run dev
    └── Landing page: marketing, features, "Start a meeting"
 
 2. User clicks "Start a meeting" → /room/create
-   └── Server generates crypto.randomUUID() → redirect to /room/<uuid>
+   └── Step 1: room name
+   └── Step 2: password + confirm → POST /api/room/create
+   └── Redirect to /room/<uuid> (creator token + session in sessionStorage)
 
 3. /room/<uuid> loads RoomPage
-   └── Name modal (if no name in localStorage)
-   └── User enters display name → saved to localStorage
+   └── Guest: password modal → verify API → session token
+   └── Host: auto-verify with creator token
+   └── Name modal (host can set display name)
+   └── Display name saved to localStorage
 
 4. Browser requests getUserMedia (camera + mic)
    └── On deny: permission banner shown
@@ -228,9 +259,13 @@ PORT=3001 npm run dev
    └── Lower peerId creates offer → answer → ICE trickle
    └── Media flows P2P (SRTP)
 
-7. Parallel connections
+7. Parallel connections (all with ?token=<sessionToken>)
    └── Chat WS: /room/<uuid>/chat/websocket
    └── Viewer count WS: /room/<uuid>/viewer/websocket (count every 1s)
+
+7b. In-call extras
+   └── Hand raise: { event: "hand-raise", raised: true|false } → broadcast hand-raised
+   └── Layout: Auto | Grid | Spotlight | Sidebar (localStorage)
 
 8. User leaves → WS close → peer-left broadcast → others close RTCPeerConnection
 ```
@@ -364,7 +399,8 @@ NexusRTC/
 │   │       └── [uuid]/
 │   │           └── page.tsx     # Server: build roomLink, render <RoomPage />
 │   └── components/
-│       ├── RoomPage.tsx         # ~1200 lines — WebRTC, signaling, recording, UI
+│       ├── RoomPage.tsx         # WebRTC, signaling, recording, layouts, hand raise
+│       ├── room/RoomControlsDock.tsx  # Mic, cam, share, record, hand, layout UI
 │       ├── Chat.tsx             # Chat WebSocket client
 │       ├── StreamPage.tsx       # Viewer-oriented variant (partial / legacy stream API)
 │       ├── ThemeProvider.tsx    # Applies data-theme on <html>
@@ -405,10 +441,14 @@ NexusRTC/
 
 ```js
 {
-  peers: Map<peerId, { ws, name, isViewer }>,
+  roomName: string,
+  passwordHash: string,
+  creatorToken: string,
+  sessions: Set<sessionToken>,
+  peers: Map<peerId, { ws, name, isViewer, handRaised }>,
   hub: { clients: Set<WebSocket> },
   viewerSockets: Set<WebSocket>,
-  recordingPeer: { peerId, name } | null  // set at runtime by server.js
+  recordingPeer: { peerId, name } | null
 }
 ```
 
@@ -442,8 +482,11 @@ NexusRTC/
 | Route | Type | Description |
 |-------|------|-------------|
 | `/` | Static page | Landing / marketing |
-| `/room/create` | Server redirect | `randomUUID()` → `/room/<uuid>` |
+| `/room/create` | Client page | Room name + password → `POST /api/room/create` |
 | `/room/[uuid]` | Dynamic page | Video room (`RoomPage`) |
+| `POST /api/room/create` | API | Create room (password hash, creator token) |
+| `POST /api/room/verify` | API | Verify password → session token |
+| `GET /api/room/[uuid]/status` | API | Room exists, name, peer count |
 | `POST /api/recordings` | API | Upload recording blob |
 | `GET /recordings/<file>` | Static | Files in `public/recordings/` |
 
@@ -489,9 +532,11 @@ All WebSockets use the **same host and port** as the website. Use `wss://` when 
 
 | Path | Direction | Purpose |
 |------|-----------|---------|
-| `/room/:uuid/websocket` | Bidirectional | WebRTC signaling + room events |
-| `/room/:uuid/chat/websocket` | Bidirectional | Chat fan-out |
-| `/room/:uuid/viewer/websocket` | Server → client | Participant count (string integer) every ~1s |
+| `/room/:uuid/websocket?token=` | Bidirectional | WebRTC signaling + room events |
+| `/room/:uuid/chat/websocket?token=` | Bidirectional | Chat fan-out (sender excluded from echo) |
+| `/room/:uuid/viewer/websocket?token=` | Server → client | Participant count every ~1s |
+
+> All room WebSockets require a valid **session token** query param. Unauthorized connections close with code `4001`.
 
 ### Signaling — client → server
 
@@ -507,6 +552,9 @@ All WebSockets use the **same host and port** as the website. Use `wss://` when 
 // Recording awareness
 { "event": "recording-started", "name": "Alice" }
 { "event": "recording-stopped" }
+
+// Hand raise (broadcast to others)
+{ "event": "hand-raise", "raised": true }
 ```
 
 ### Signaling — server → client
@@ -516,7 +564,7 @@ All WebSockets use the **same host and port** as the website. Use `wss://` when 
 {
   "event": "joined",
   "peerId": "<your-uuid>",
-  "peers": [{ "id": "...", "name": "Bob" }],
+  "peers": [{ "id": "...", "name": "Bob", "handRaised": false }],
   "viewer": false,
   "recordingPeer": { "peerId": "...", "name": "..." } | null
 }
@@ -536,6 +584,9 @@ All WebSockets use the **same host and port** as the website. Use `wss://` when 
 // Recording
 { "event": "recording-started", "peerId": "...", "name": "Alice" }
 { "event": "recording-stopped", "peerId": "..." }
+
+// Hand raise
+{ "event": "hand-raised", "peerId": "...", "raised": true }
 ```
 
 ### Chat — client → server (broadcast to all in room)
@@ -641,6 +692,12 @@ flowchart LR
 
 Chat is **not end-to-end encrypted**. Messages are visible to the server process and all clients in the room. Use **HTTPS** in production so transport is encrypted.
 
+| Behavior | Detail |
+|----------|--------|
+| Send path | Optimistic UI append + server broadcast (excludes sender socket) |
+| Reconnect | Connection generation guard — no duplicate sockets on token URL change |
+| Dedupe | Recent message keys prevent double display on edge cases |
+
 ---
 
 ## UI & Design System
@@ -681,10 +738,21 @@ Chat is **not end-to-end encrypted**. Messages are visible to the server process
 │  │                      │  │ (when alone)        │   │
 │  └──────────────────────┘  └─────────────────────┘   │
 ├─────────────────────────────────────────────────────────┤
-│         [ Mic ] [ Cam ] [ Share ] [ Rec ]  Name         │  ← fixed dock
+│  [Mic][Cam][Share][Rec] | [Hand][Layout]  Name          │  ← round icon dock
 │                                    [ Chat panel ]      │
 └─────────────────────────────────────────────────────────┘
 ```
+
+**Video layouts** (Layout button in dock):
+
+| Mode | Description |
+|------|-------------|
+| **Auto** | Grid adapts to participant count (default) |
+| **Grid** | Equal tiles, `auto-fill` columns |
+| **Spotlight** | Large primary remote + filmstrip of others |
+| **Sidebar** | Main video left, thumbnails right |
+
+Stored in `localStorage` key `nexus-video-layout`.
 
 ---
 
@@ -701,6 +769,8 @@ Chat is **not end-to-end encrypted**. Messages are visible to the server process
 | State / ref | Purpose |
 |-------------|---------|
 | `userName` | Display name |
+| `videoLayout` | `auto` \| `grid` \| `spotlight` \| `sidebar` |
+| `raisedHands` / `isHandRaised` | Hand-raise sync across peers |
 | `remoteStreams` | `peerId → MediaStream` for tiles |
 | `peerNames` | `peerId → string` |
 | `peersRef` | `peerId → RTCPeerConnection` |
@@ -714,6 +784,9 @@ Chat is **not end-to-end encrypted**. Messages are visible to the server process
 |-----|---------|
 | `nexus-theme` | ThemeToggle |
 | `nexus-chat-name` | RoomPage name modal + Chat |
+| `nexus-video-layout` | Room video layout preference |
+| `nexus-room-session-<uuid>` | Session token (sessionStorage) |
+| `nexus-room-creator-<uuid>` | Creator token (sessionStorage) |
 
 ---
 
@@ -1000,14 +1073,22 @@ A: On the server under `public/recordings/` after upload. Lock down or remove th
 A: Not as serverless-only. You need the full `server.js` process (VPS, Docker, Railway, Render, Fly.io, etc.) for WebSockets.
 
 **Q: Do room links expire?**  
-A: No automatic expiry. A room exists in memory while the server is running and peers may still be connected. Restarting the server clears all rooms.
+A: No automatic expiry. A room exists in memory while the server is running. Restarting the server clears all rooms — create a new room after restart.
+
+**Q: I have the link and password but see “Room not found”?**  
+A: Restart `npm run dev` and **create a new room**. Room state is in-memory; after a server restart old rooms are gone.
+
+**Q: How do video layouts work?**  
+A: Click **Layout** in the bottom dock. Choose Auto, Grid, Spotlight, or Sidebar. Your choice is saved in `localStorage` for next visits.
 
 ---
 
 ## Roadmap
 
 - [ ] TURN (`coturn`) in `docker-compose.yml`
-- [ ] Room passwords / join tokens
+- [x] Room passwords + session tokens for WebSockets
+- [x] Video layouts (Auto / Grid / Spotlight / Sidebar)
+- [x] Hand raise + polished control dock
 - [ ] SFU mode for 8+ participants
 - [ ] Persistent chat (Redis/SQLite + TTL)
 - [ ] Server-side recording (headless Chromium)
@@ -1044,7 +1125,18 @@ Open source — use, fork, and adapt freely. A GitHub star is appreciated if you
 
 <div align="center">
 
-**Built with Next.js · React · WebRTC · Node.js**
+<h3>
+  <b>
+    <font color="#94a3b8">Built with Next.js · React · WebRTC · Node.js</font>
+  </b>
+</h3>
+
+<br>
+
+[![Star on GitHub](https://img.shields.io/github/stars/subhm2004/NexusRTC?style=social&label=Star)](https://github.com/subhm2004/NexusRTC)
+[![Issues](https://img.shields.io/github/issues/subhm2004/NexusRTC?style=flat&label=Issues)](https://github.com/subhm2004/NexusRTC/issues)
+
+<br>
 
 [Report issues](https://github.com/subhm2004/NexusRTC/issues) · [Star on GitHub](https://github.com/subhm2004/NexusRTC)
 
