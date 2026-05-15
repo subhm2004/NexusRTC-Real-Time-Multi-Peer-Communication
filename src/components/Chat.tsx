@@ -237,7 +237,12 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
   return (
     <div className={"chat-box" + (open ? " is-open" : "")}>
       <div className="chat-header" onClick={slide}>
-        <span>Chat</span>
+        <span className="chat-header-title">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+            <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+          </svg>
+          Chat
+        </span>
         <span className="chat-header-you" onClick={(e) => e.stopPropagation()}>
           {editingName ? (
             <input

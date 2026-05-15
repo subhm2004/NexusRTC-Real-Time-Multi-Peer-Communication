@@ -236,9 +236,14 @@ function NameInputModal({ onJoin }: { onJoin: (name: string) => void }) {
 
   return (
     <div className="name-modal-overlay">
-      <div className="name-modal">
-        <h2 className="name-modal-title">Enter Your Name</h2>
-        <p className="name-modal-subtitle">Choose a name to join the room</p>
+      <div className="name-modal name-modal-room">
+        <div className="name-modal-icon" aria-hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+          </svg>
+        </div>
+        <h2 className="name-modal-title">Join the room</h2>
+        <p className="name-modal-subtitle">Pick a display name — friends will see this on your video tile</p>
         <form onSubmit={handleSubmit}>
           <input
             ref={inputRef}
@@ -639,7 +644,10 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
     };
   }, [roomWsUrl, connectRoomWs, userName]);
 
-  const hasPeers = Object.keys(remoteStreams).length > 0;
+  const remoteCount = Object.keys(remoteStreams).length;
+  const hasPeers = remoteCount > 0;
+  const participantCount = 1 + remoteCount;
+  const gridSizeClass = `video-grid--count-${Math.min(participantCount, 6)}`;
 
   // Toggle audio mute/unmute
   const toggleMute = useCallback(() => {
@@ -1013,36 +1021,42 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
   }
 
   return (
-    <div className="app-wrap">
-      <nav className="app-nav">
-        <Link href="/" className="app-nav-brand">
+    <div className="room-page">
+      <div className="room-page-bg" aria-hidden>
+        <div className="landing-orb landing-orb-1" />
+        <div className="landing-orb landing-orb-2" />
+      </div>
+
+      <header className="room-nav">
+        <Link href="/" className="landing-brand room-nav-brand">
+          <span className="landing-brand-icon" aria-hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+          </span>
           NexusRTC
         </Link>
-        <div className="app-nav-end">
-          <a
-            href="https://github.com/subhm2004/NexusRTC-Real-Time-Multi-Peer-Communication"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="btn btn-ghost btn-sm"
-            title="View on GitHub"
-          >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
-            </svg>
-            GitHub
-          </a>
-          <ThemeToggle />
+        <div className="room-nav-meta">
+          <span className="room-id-pill" title={uuid}>
+            Room · {uuid.slice(0, 8)}
+          </span>
+          <span className="viewer-badge room-viewer-badge">
+            <span className="viewer-badge-dot" />
+            {viewerCount} in call
+          </span>
+        </div>
+        <div className="room-nav-actions">
           <CopyLinkButton roomLink={roomLink} copy={copy} />
-          <Link href="/" className="btn btn-danger btn-sm">
-            Leave Room
+          <ThemeToggle />
+          <Link href="/" className="btn btn-danger btn-sm room-leave-btn">
+            Leave
           </Link>
         </div>
-      </nav>
+      </header>
 
       <Chat wsUrl={chatWsUrl} />
 
-      <div className="viewer-badge">Viewers: {viewerCount}</div>
-
+      <main className="room-main">
       {recordingPeer && !isRecording && (
         <div className="recording-by-peer-banner">
           <span className="recording-dot" />
@@ -1057,8 +1071,8 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
       )}
 
       {!noPerm && (
-        <div id="peers">
-          <div className="video-grid" id="videos">
+        <div className="room-stage" id="peers">
+          <div className={`video-grid ${gridSizeClass}`} id="videos">
             <div className="video-tile you">
               <video ref={localVideoRef} className={isScreenSharing ? '' : 'mirror'} autoPlay muted playsInline style={{ opacity: isVideoEnabled || isScreenSharing ? 1 : 0.3 }} />
               {!isVideoEnabled && (
@@ -1072,7 +1086,7 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
                 </div>
               )}
               <span className="video-tile-label">{userName}</span>
-              <div className="video-controls">
+              <div className="video-controls video-controls--hidden">
                 <button
                   type="button"
                   className={`video-control-btn ${isMuted ? 'active' : ''}`}
@@ -1165,13 +1179,8 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
                 </div>
               )}
             </div>
-            {!hasPeers && !connClosed && (
-              <div className="notif notif-warn" style={{ gridColumn: "1 / -1" }}>
-                No one else in the room yet. Share your room link with friends.
-              </div>
-            )}
             {connClosed && (
-              <div className="notif notif-danger" style={{ gridColumn: "1 / -1" }}>
+              <div className="room-alert room-alert-danger">
                 Connection closed. Please refresh the page.
               </div>
             )}
@@ -1197,25 +1206,97 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
               );
             })}
           </div>
+          {!hasPeers && !connClosed && (
+            <aside className="room-empty-panel">
+              <div className="room-empty-icon" aria-hidden>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+                  <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
+                  <circle cx="9" cy="7" r="4" />
+                  <path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
+                </svg>
+              </div>
+              <h3>Waiting for others</h3>
+              <p>Share your room link — friends can join instantly from any browser.</p>
+              <CopyLinkButton roomLink={roomLink} copy={copy} />
+            </aside>
+          )}
         </div>
       )}
 
-      {/* Debug info - remove in production */}
-      {process.env.NODE_ENV === 'development' && (
-        <div style={{ marginTop: '1rem', padding: '1rem', background: 'var(--bg-muted)', borderRadius: 'var(--radius)', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-          <div>Remote streams: {Object.keys(remoteStreams).length}</div>
-          <div>Peers connected: {peersRef.current.size}</div>
-          {Object.entries(remoteStreams).map(([pid, s]) => (
-            <div key={pid}>
-              {pid.slice(0, 8)}: {s.getTracks().length} tracks (V:{s.getVideoTracks().length} A:{s.getAudioTracks().length})
-            </div>
-          ))}
+      {!noPerm && (
+        <div className="room-controls-dock">
+          <div className="room-controls-inner">
+            <button
+              type="button"
+              className={`room-ctrl-btn ${isMuted ? "is-off" : ""}`}
+              onClick={toggleMute}
+              title={isMuted ? "Unmute" : "Mute"}
+              aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
+            >
+              {isMuted ? (
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M12 1L8 5H4a2 2 0 00-2 2v6a2 2 0 002 2h4l4 4V1z" />
+                  <line x1="23" y1="1" x2="1" y2="23" />
+                </svg>
+              ) : (
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M12 1L8 5H4a2 2 0 00-2 2v6a2 2 0 002 2h4l4 4V1z" />
+                </svg>
+              )}
+              <span>Mic</span>
+            </button>
+            <button
+              type="button"
+              className={`room-ctrl-btn ${!isVideoEnabled ? "is-off" : ""}`}
+              onClick={toggleVideo}
+              title={isVideoEnabled ? "Turn off camera" : "Turn on camera"}
+              aria-label={isVideoEnabled ? "Turn off camera" : "Turn on camera"}
+            >
+              {isVideoEnabled ? (
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M23 7l-7 5 7 5V7z" />
+                  <rect x="1" y="5" width="15" height="14" rx="2" />
+                </svg>
+              ) : (
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M23 7l-7 5 7 5V7z" />
+                  <rect x="1" y="5" width="15" height="14" rx="2" />
+                  <line x1="1" y1="1" x2="16" y2="16" />
+                </svg>
+              )}
+              <span>Cam</span>
+            </button>
+            <button
+              type="button"
+              className={`room-ctrl-btn ${isScreenSharing ? "is-active" : ""}`}
+              onClick={isScreenSharing ? stopScreenShare : startScreenShare}
+              title={isScreenSharing ? "Stop sharing" : "Share screen"}
+              aria-label={isScreenSharing ? "Stop sharing screen" : "Share screen"}
+            >
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="2" y="3" width="20" height="14" rx="2" />
+                <path d="M8 21h8M12 17v4" />
+              </svg>
+              <span>Share</span>
+            </button>
+            <button
+              type="button"
+              className={`room-ctrl-btn ${isRecording ? "is-recording" : ""}`}
+              onClick={isRecording ? stopRecording : startRecording}
+              title={isRecording ? "Stop recording" : "Record"}
+              aria-label={isRecording ? "Stop recording" : "Start recording"}
+            >
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <circle cx="12" cy="12" r="10" />
+                <circle cx="12" cy="12" r="3" fill="currentColor" />
+              </svg>
+              <span>Rec</span>
+            </button>
+            <span className="room-controls-user">{userName}</span>
+          </div>
         </div>
       )}
-
-      <footer className="app-footer">
-        <p></p>
-      </footer>
+      </main>
     </div>
   );
 }
