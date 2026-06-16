@@ -1,16 +1,30 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { emitChat, type RoomSocket } from "@/lib/socket-client";
+import {
+  decryptChatPayload,
+  encryptChatPayload,
+  isEncryptedEnvelope,
+  wrapEncryptedEnvelope,
+} from "@/lib/chat-crypto";
 
 const CHAT_NAME_KEY = "nexus-chat-name";
-const TYPING_TIMEOUT = 3000; // 3 seconds
-const TYPING_DEBOUNCE = 500; // 500ms debounce
+const TYPING_TIMEOUT = 3000;
+const TYPING_DEBOUNCE = 500;
+const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+
+type ChatLogEntry = {
+  type: "message" | "typing" | "image";
+  name?: string;
+  text?: string;
+  image?: string;
+  time?: string;
+};
 
 function currentTime() {
   const d = new Date();
-  const h = String(d.getHours()).padStart(2, "0");
-  const m = String(d.getMinutes()).padStart(2, "0");
-  return `${h}:${m}`;
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 function getOrCreateUserName(): string {
@@ -22,67 +36,127 @@ function getOrCreateUserName(): string {
   return name;
 }
 
-function parseChatMessage(raw: string): { type: "message" | "typing" | "image"; name?: string; text?: string; image?: string } | null {
-  try {
-    const d = JSON.parse(raw);
-    if (d.type === "typing" && typeof d.n === "string") {
-      return { type: "typing", name: d.n };
-    }
-    if (d.type === "image" && typeof d.n === "string" && typeof d.url === "string") {
-      return { type: "image", name: d.n, image: d.url };
-    }
-    if (d && typeof d.n === "string" && typeof d.m === "string") {
-      return { type: "message", name: d.n, text: d.m };
-    }
-  } catch {
-    // backward compat: plain text
+async function resolveIncomingPayload(
+  raw: Record<string, unknown>,
+  chatKey: CryptoKey | null
+): Promise<Record<string, unknown> | null> {
+  if (isEncryptedEnvelope(raw)) {
+    if (!chatKey) return null;
+    return decryptChatPayload(chatKey, raw.c);
+  }
+  return raw;
+}
+
+function payloadToLogEntry(d: Record<string, unknown>): ChatLogEntry | null {
+  if (d?.type === "image" && typeof d.n === "string" && typeof d.url === "string") {
+    return { type: "image", name: d.n, image: d.url, time: currentTime() };
+  }
+  if (typeof d?.n === "string" && typeof d?.m === "string") {
+    return { type: "message", name: d.n, text: d.m, time: currentTime() };
   }
   return null;
 }
 
-export function Chat({ wsUrl }: { wsUrl: string }) {
+export function Chat({
+  socket,
+  chatKey,
+  encrypted = false,
+}: {
+  socket: RoomSocket | null;
+  chatKey?: CryptoKey | null;
+  encrypted?: boolean;
+}) {
   const [userName, setUserName] = useState("User");
   const [editingName, setEditingName] = useState(false);
   const [nameInput, setNameInput] = useState("");
   const [open, setOpen] = useState(false);
-  const [logs, setLogs] = useState<Array<{ type: "message" | "typing" | "image"; name?: string; text?: string; image?: string; time?: string }>>([]);
+  const [logs, setLogs] = useState<ChatLogEntry[]>([]);
   const [hasNew, setHasNew] = useState(false);
   const [ready, setReady] = useState(false);
   const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set());
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
-  const wsRef = useRef<WebSocket | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const typingDebounceRef = useRef<NodeJS.Timeout | null>(null);
   const openRef = useRef(open);
   const userNameInit = useRef(false);
-  const connectGenRef = useRef(0);
   const recentMsgKeysRef = useRef<string[]>([]);
   const userNameRef = useRef(userName);
+  const chatKeyRef = useRef(chatKey ?? null);
   openRef.current = open;
   userNameRef.current = userName;
+  chatKeyRef.current = chatKey ?? null;
 
-  const appendLog = useCallback(
-    (entry: { type: "message" | "typing" | "image"; name?: string; text?: string; image?: string; time?: string }) => {
-      if (entry.type === "message") {
-        const key = `m:${entry.name}:${entry.text}`;
-        if (recentMsgKeysRef.current.includes(key)) return;
-        recentMsgKeysRef.current.push(key);
-        if (recentMsgKeysRef.current.length > 80) {
-          recentMsgKeysRef.current = recentMsgKeysRef.current.slice(-40);
+  const appendLog = useCallback((entry: ChatLogEntry) => {
+    if (entry.type === "message") {
+      const key = `m:${entry.name}:${entry.text}`;
+      if (recentMsgKeysRef.current.includes(key)) return;
+      recentMsgKeysRef.current.push(key);
+      if (recentMsgKeysRef.current.length > 80) {
+        recentMsgKeysRef.current = recentMsgKeysRef.current.slice(-40);
+      }
+    }
+    if (entry.type === "image") {
+      const key = `i:${entry.name}:${entry.image?.slice(0, 80)}`;
+      if (recentMsgKeysRef.current.includes(key)) return;
+      recentMsgKeysRef.current.push(key);
+    }
+    setLogs((prev) => [...prev, entry]);
+    if (!openRef.current) setHasNew(true);
+    setTimeout(() => logEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+  }, []);
+
+  const processPayload = useCallback(
+    async (raw: string | Record<string, unknown>) => {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (!parsed || typeof parsed !== "object") return;
+
+      if (parsed.type === "history" && Array.isArray(parsed.messages)) {
+        for (const msg of parsed.messages) {
+          if (!msg || typeof msg !== "object") continue;
+          const resolved = await resolveIncomingPayload(
+            msg as Record<string, unknown>,
+            chatKeyRef.current
+          );
+          if (!resolved) continue;
+          const entry = payloadToLogEntry(resolved);
+          if (entry) appendLog(entry);
         }
+        return;
       }
-      if (entry.type === "image") {
-        const key = `i:${entry.name}:${entry.image?.slice(0, 80)}`;
-        if (recentMsgKeysRef.current.includes(key)) return;
-        recentMsgKeysRef.current.push(key);
+
+      if (parsed.type === "typing" && typeof parsed.n === "string") {
+        if (parsed.n !== userNameRef.current) {
+          setTypingUsers((prev) => new Set(prev).add(parsed.n as string));
+          setTimeout(() => {
+            setTypingUsers((p) => {
+              const n = new Set(p);
+              n.delete(parsed.n as string);
+              return n;
+            });
+          }, TYPING_TIMEOUT);
+        }
+        return;
       }
-      setLogs((prev) => [...prev, entry]);
-      if (!openRef.current) setHasNew(true);
-      setTimeout(() => logEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+
+      const resolved = await resolveIncomingPayload(
+        parsed as Record<string, unknown>,
+        chatKeyRef.current
+      );
+      if (!resolved) return;
+
+      if (resolved.type === "typing") return;
+
+      setTypingUsers((prev) => {
+        const next = new Set(prev);
+        if (typeof resolved.n === "string") next.delete(resolved.n);
+        return next;
+      });
+
+      const entry = payloadToLogEntry(resolved);
+      if (entry) appendLog(entry);
     },
-    []
+    [appendLog]
   );
 
   useEffect(() => {
@@ -92,121 +166,34 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
     }
   }, []);
 
-  const connect = useCallback(() => {
-    if (!wsUrl || typeof window === "undefined") return;
-    if (wsRef.current?.readyState === 1) return;
-
-    const gen = ++connectGenRef.current;
-
-    if (wsRef.current) {
-      wsRef.current.onclose = null;
-      wsRef.current.close();
-      wsRef.current = null;
+  useEffect(() => {
+    if (!socket) {
+      setReady(false);
+      return;
     }
 
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    const onConnect = () => setReady(true);
+    const onDisconnect = () => setReady(false);
+    const onChat = (payload: string | Record<string, unknown>) => {
+      processPayload(payload).catch(() => {
+        if (typeof payload === "string") {
+          appendLog({ type: "message", name: "Unknown", text: payload, time: currentTime() });
+        }
+      });
+    };
 
-    ws.onclose = () => {
-      setReady(false);
-      if (wsRef.current === ws) wsRef.current = null;
-      if (connectGenRef.current !== gen) return;
-      setTimeout(() => {
-        if (connectGenRef.current === gen && wsUrl) connect();
-      }, 1000);
-    };
-    ws.onopen = () => {
-      if (connectGenRef.current === gen) setReady(true);
-    };
-    ws.onmessage = (e) => {
-      const raw = e.data as string;
-      
-      try {
-        const d = JSON.parse(raw);
-        
-        // Handle typing messages separately
-        if (d && d.type === "typing" && typeof d.n === "string") {
-          if (d.n !== userNameRef.current) {
-            setTypingUsers((prev) => {
-              const next = new Set(prev);
-              next.add(d.n);
-              return next;
-            });
-            setTimeout(() => {
-              setTypingUsers((p) => {
-                const n = new Set(p);
-                n.delete(d.n);
-                return n;
-              });
-            }, TYPING_TIMEOUT);
-          }
-          return; // Don't add typing messages to chat logs
-        }
-        
-        // Handle image messages
-        if (d && d.type === "image" && typeof d.n === "string" && typeof d.url === "string") {
-          // Clear typing indicator
-          setTypingUsers((prev) => {
-            const next = new Set(prev);
-            next.delete(d.n);
-            return next;
-          });
-          
-          appendLog({
-            type: "image",
-            name: d.n,
-            image: d.url,
-            text: "",
-            time: currentTime(),
-          });
-          return;
-        }
-        
-        // Handle regular text messages
-        if (d && typeof d.n === "string" && typeof d.m === "string") {
-          // Clear typing indicator
-          setTypingUsers((prev) => {
-            const next = new Set(prev);
-            next.delete(d.n);
-            return next;
-          });
-          
-          appendLog({
-            type: "message",
-            name: d.n,
-            text: d.m,
-            image: "",
-            time: currentTime(),
-          });
-          return;
-        }
-      } catch {
-        appendLog({
-          type: "message",
-          name: "Unknown",
-          text: raw,
-          image: "",
-          time: currentTime(),
-        });
-      }
-    };
-  }, [wsUrl, appendLog]);
+    if (socket.connected) setReady(true);
+    socket.on("connect", onConnect);
+    socket.on("disconnect", onDisconnect);
+    socket.on("chat", onChat);
 
-  useEffect(() => {
-    if (!wsUrl) return;
-    connect();
     return () => {
-      connectGenRef.current += 1;
-      if (wsRef.current) {
-        wsRef.current.onclose = null;
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-      setReady(false);
+      socket.off("connect", onConnect);
+      socket.off("disconnect", onDisconnect);
+      socket.off("chat", onChat);
     };
-  }, [wsUrl, connect]);
+  }, [socket, appendLog, processPayload]);
 
-  // Close emoji picker on outside click
   useEffect(() => {
     if (!showEmojiPicker) return;
     const handleClick = (e: MouseEvent) => {
@@ -219,28 +206,42 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
     return () => document.removeEventListener("mousedown", handleClick);
   }, [showEmojiPicker]);
 
+  const emitPayload = useCallback(
+    async (payload: Record<string, unknown>) => {
+      if (!socket?.connected) return;
+      const key = chatKeyRef.current;
+      if (key && encrypted) {
+        const token = await encryptChatPayload(key, payload);
+        emitChat(socket, wrapEncryptedEnvelope(token));
+        return;
+      }
+      emitChat(socket, payload);
+    },
+    [socket, encrypted]
+  );
+
   const sendTyping = useCallback(() => {
-    if (!wsRef.current || wsRef.current.readyState !== 1) return;
+    if (!socket?.connected) return;
     if (typingDebounceRef.current) clearTimeout(typingDebounceRef.current);
     typingDebounceRef.current = setTimeout(() => {
-      wsRef.current?.send(JSON.stringify({ type: "typing", n: userName }));
+      emitPayload({ type: "typing", n: userName }).catch(() => {});
     }, TYPING_DEBOUNCE);
-  }, [userName]);
+  }, [socket, userName, emitPayload]);
 
   const sendImage = (file: File) => {
-    if (!wsRef.current || wsRef.current.readyState !== 1) return;
+    if (!socket?.connected) return;
+    if (file.size > MAX_IMAGE_BYTES) {
+      alert(`Image too large. Max ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)} MB.`);
+      return;
+    }
     const reader = new FileReader();
     reader.onload = (e) => {
       const dataUrl = e.target?.result as string;
       if (!dataUrl) return;
-      wsRef.current?.send(JSON.stringify({ type: "image", n: userName, url: dataUrl }));
-      appendLog({
-        type: "image",
-        name: userName,
-        image: dataUrl,
-        text: "",
-        time: currentTime(),
-      });
+      const payload = { type: "image", n: userName, url: dataUrl };
+      emitPayload(payload)
+        .then(() => appendLog({ type: "image", name: userName, image: dataUrl, time: currentTime() }))
+        .catch(() => {});
     };
     reader.readAsDataURL(file);
   };
@@ -249,23 +250,11 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
     e.preventDefault();
     const inp = inputRef.current;
     const text = inp?.value?.trim();
-    if (!text || !wsRef.current || wsRef.current.readyState !== 1) return;
-    
-    // Clear typing indicators
-    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    if (!text || !socket?.connected) return;
     if (typingDebounceRef.current) clearTimeout(typingDebounceRef.current);
-    
-    const payload = JSON.stringify({ n: userName, m: text });
-    wsRef.current.send(payload);
-
-    appendLog({
-      type: "message",
-      name: userName,
-      text,
-      image: "",
-      time: currentTime(),
-    });
-
+    emitPayload({ n: userName, m: text })
+      .then(() => appendLog({ type: "message", name: userName, text, time: currentTime() }))
+      .catch(() => {});
     inp!.value = "";
   };
 
@@ -287,85 +276,116 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
   };
 
   return (
-    <div className={"chat-box" + (open ? " is-open" : "")}>
-      <div className="chat-header" onClick={slide}>
-        <span className="chat-header-title">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+    <div className={"chat-panel" + (open ? " is-open" : "")}>
+      <button type="button" className="chat-toggle" onClick={slide} aria-expanded={open}>
+        <span className="chat-toggle-icon" aria-hidden>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
           </svg>
-          Chat
         </span>
-        <span className="chat-header-you" onClick={(e) => e.stopPropagation()}>
-          {editingName ? (
-            <input
-              className="chat-name-input"
-              value={nameInput}
-              onChange={(e) => setNameInput(e.target.value)}
-              onBlur={saveName}
-              onKeyDown={(e) => (e.key === "Enter" ? saveName() : null)}
-              onClick={(e) => e.stopPropagation()}
-              placeholder="Your name"
-              autoFocus
-            />
-          ) : (
-            <span
-              className="chat-you"
-              onClick={(e) => {
-                e.stopPropagation();
-                setNameInput(userName);
-                setEditingName(true);
-              }}
-              title="Click to change name"
-            >
-              (You: {userName})
-            </span>
-          )}
-        </span>
+        <span className="chat-toggle-label">Chat</span>
+        {encrypted && <span className="chat-encrypted-badge" title="End-to-end encrypted">🔒</span>}
         {hasNew && <span className="chat-dot" />}
-      </div>
-      <div className="chat-body">
+        {!ready && <span className="chat-status-dot" title="Connecting…" />}
+      </button>
+
+      <div className="chat-drawer">
+        <div className="chat-drawer-head">
+          <div className="chat-drawer-head-main">
+            <h3>{encrypted ? "Encrypted chat" : "Live chat"}</h3>
+            {encrypted && (
+              <span className="chat-secure-pill">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
+                  <rect x="3" y="11" width="18" height="11" rx="2" />
+                  <path d="M7 11V7a5 5 0 0110 0v4" />
+                </svg>
+                End-to-end secured
+              </span>
+            )}
+          </div>
+          <span className="chat-drawer-you" onClick={(e) => e.stopPropagation()}>
+            {editingName ? (
+              <input
+                className="chat-name-input"
+                value={nameInput}
+                onChange={(e) => setNameInput(e.target.value)}
+                onBlur={saveName}
+                onKeyDown={(e) => (e.key === "Enter" ? saveName() : null)}
+                placeholder="Your name"
+                autoFocus
+              />
+            ) : (
+              <button
+                type="button"
+                className="chat-you"
+                onClick={() => {
+                  setNameInput(userName);
+                  setEditingName(true);
+                }}
+                title="Click to change display name"
+              >
+                <span className="chat-you-label">You</span>
+                <span className="chat-you-name">{userName}</span>
+              </button>
+            )}
+          </span>
+        </div>
+
         <div className="chat-messages">
+          {logs.length === 0 && (
+            <div className={`chat-empty ${encrypted ? "chat-empty--secure" : ""}`}>
+              <div className="chat-empty-visual" aria-hidden>
+                {encrypted ? (
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <rect x="3" y="11" width="18" height="11" rx="2" />
+                    <path d="M7 11V7a5 5 0 0110 0v4" />
+                  </svg>
+                ) : (
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+                  </svg>
+                )}
+              </div>
+              <p>No messages yet</p>
+              <span>
+                {encrypted
+                  ? "Only people in this room can read messages"
+                  : "Say hello to everyone in the call"}
+              </span>
+            </div>
+          )}
           {logs.map((l, i) => (
-            <div key={i} className={`chat-msg ${l.type === "image" ? "chat-msg-image" : ""}`}>
+            <div
+              key={i}
+              className={`chat-bubble ${l.name === userName ? "chat-bubble--self" : ""} ${l.type === "image" ? "chat-bubble--image" : ""}`}
+            >
+              {l.type !== "image" && <span className="chat-bubble-meta">{l.name} · {l.time}</span>}
               {l.type === "image" && l.image ? (
                 <>
-                  <div className="chat-msg-header">{l.time} - {l.name || "Unknown"}:</div>
-                  <img 
-                    src={l.image} 
-                    alt={`Image shared by ${l.name || "Unknown"}`} 
-                    className="chat-image"
-                    onError={(e) => {
-                      const target = e.target as HTMLImageElement;
-                      const parent = target.parentElement;
-                      if (parent) {
-                        target.style.display = "none";
-                        const errorDiv = document.createElement("div");
-                        errorDiv.style.cssText = "color: var(--text-muted); font-size: 0.85rem; margin-top: 0.5rem;";
-                        errorDiv.textContent = "Image failed to load";
-                        parent.appendChild(errorDiv);
-                      }
-                    }}
-                  />
+                  <span className="chat-bubble-meta">{l.name} · {l.time}</span>
+                  <img src={l.image} alt={`Shared by ${l.name}`} className="chat-image" />
                 </>
               ) : (
-                <>{l.time} - {l.name || "Unknown"}: {l.text || ""}</>
+                <span className="chat-bubble-text">{l.text}</span>
               )}
             </div>
           ))}
           {typingUsers.size > 0 && (
             <div className="chat-typing">
-              {Array.from(typingUsers).join(", ")} {typingUsers.size === 1 ? "is" : "are"} typing...
+              {Array.from(typingUsers).join(", ")} typing…
             </div>
           )}
           <div ref={logEndRef} />
         </div>
+
         <form className="chat-form" onSubmit={send}>
           <div className="chat-input-wrapper">
             <input
               ref={inputRef}
               className="chat-input"
               type="text"
-              placeholder="Type a message..."
+              placeholder={ready ? "Type a message…" : "Connecting…"}
+              disabled={!ready}
               onChange={sendTyping}
               onPaste={(e) => {
                 const items = e.clipboardData.items;
@@ -384,8 +404,14 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
               className="chat-emoji-btn"
               onClick={() => setShowEmojiPicker(!showEmojiPicker)}
               title="Add emoji"
+              aria-label="Add emoji"
             >
-              😊
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <circle cx="12" cy="12" r="10" />
+                <path d="M8 14s1.5 2 4 2 4-2 4-2" />
+                <line x1="9" y1="9" x2="9.01" y2="9" />
+                <line x1="15" y1="9" x2="15.01" y2="9" />
+              </svg>
             </button>
             {showEmojiPicker && (
               <div className="chat-emoji-picker">
@@ -409,12 +435,16 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
               </div>
             )}
           </div>
-          <label className="chat-image-btn" title="Upload image">
-            📷
+          <label className="chat-icon-btn chat-attach-btn" title="Upload image (max 2 MB)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+              <rect x="3" y="3" width="18" height="18" rx="2" />
+              <circle cx="8.5" cy="8.5" r="1.5" />
+              <path d="M21 15l-5-5L5 21" />
+            </svg>
             <input
               type="file"
               accept="image/*"
-              style={{ display: "none" }}
+              className="chat-file-input"
               onChange={(e) => {
                 const file = e.target.files?.[0];
                 if (file) sendImage(file);
@@ -422,8 +452,11 @@ export function Chat({ wsUrl }: { wsUrl: string }) {
               }}
             />
           </label>
-          <button type="submit" className="chat-send" disabled={!ready}>
-            Send
+          <button type="submit" className="chat-icon-btn chat-send-btn" disabled={!ready} aria-label="Send message">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+              <line x1="22" y1="2" x2="11" y2="13" />
+              <polygon points="22 2 15 22 11 13 2 9 22 2" />
+            </svg>
           </button>
         </form>
       </div>

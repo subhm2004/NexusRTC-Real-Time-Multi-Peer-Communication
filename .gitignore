@@ -7,9 +7,9 @@ out
 
 # Env
 .env
-.env.*
 .env.local
 .env.*.local
+!.env.example
 
 # Logs
 *.log
@@ -30,6 +30,10 @@ Thumbs.db
 .vercel
 .cache
 
-# Recordings (video files stored on server)
+# Recordings (private storage — not publicly served)
+data/recordings/*
+!data/recordings/.gitkeep
+
+# Legacy public recordings path
 public/recordings/*.webm
 public/recordings/*.mp4

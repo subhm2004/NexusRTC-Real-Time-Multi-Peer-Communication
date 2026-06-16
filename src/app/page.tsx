@@ -1,5 +1,7 @@
 import Link from "next/link";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { JoinRoomForm } from "@/components/JoinRoomForm";
+import { PageBackground } from "@/components/ui/PageBackground";
 
 function FeatureIcon({ children }: { children: React.ReactNode }) {
   return <div className="feature-icon-wrap">{children}</div>;
@@ -8,12 +10,7 @@ function FeatureIcon({ children }: { children: React.ReactNode }) {
 export default function WelcomePage() {
   return (
     <div className="landing">
-      <div className="landing-bg" aria-hidden>
-        <div className="landing-orb landing-orb-1" />
-        <div className="landing-orb landing-orb-2" />
-        <div className="landing-orb landing-orb-3" />
-        <div className="landing-grid" />
-      </div>
+      <PageBackground />
 
       <header className="landing-nav">
         <Link href="/" className="landing-brand">
@@ -26,7 +23,7 @@ export default function WelcomePage() {
         </Link>
         <div className="landing-nav-actions">
           <a
-            href="https://github.com/subhm2004/NexusRTC-Real-Time-Multi-Peer-Communication"
+            href="https://github.com/subhm2004/NexusRTC"
             target="_blank"
             rel="noopener noreferrer"
             className="btn btn-ghost btn-sm landing-github"
@@ -45,7 +42,7 @@ export default function WelcomePage() {
           <div className="landing-hero-content">
             <span className="landing-badge">
               <span className="landing-badge-dot" />
-              WebRTC · Peer-to-peer · No sign-up
+              WebRTC · Socket.io · No sign-up
             </span>
             <h1 className="landing-title">
               Video calls that feel
@@ -62,7 +59,8 @@ export default function WelcomePage() {
                   <path d="M5 12h14M12 5l7 7-7 7" />
                 </svg>
               </Link>
-              <span className="landing-cta-hint">Password-protected rooms · No account · Chrome, Firefox, Safari</span>
+              <JoinRoomForm />
+              <span className="landing-cta-hint">Password-protected rooms · No account · Works on Chrome, Firefox, Safari</span>
             </div>
             <div className="landing-stats">
               <div className="landing-stat">
@@ -167,12 +165,12 @@ export default function WelcomePage() {
             <article className="landing-feature-card">
               <FeatureIcon>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="3" />
-                  <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2" />
+                  <rect x="3" y="11" width="18" height="11" rx="2" />
+                  <path d="M7 11V7a5 5 0 0110 0v4" />
                 </svg>
               </FeatureIcon>
-              <h3>Dark & light mode</h3>
-              <p>Comfortable in any lighting. Theme follows your system or your saved preference.</p>
+              <h3>Password protected</h3>
+              <p>Set a room password when you create. Only people with the link and password can join.</p>
             </article>
             <article className="landing-feature-card">
               <FeatureIcon>
@@ -221,12 +219,15 @@ export default function WelcomePage() {
           <div className="landing-cta-banner-inner">
             <h2>Ready to jump in?</h2>
             <p>Your next video call is one click away.</p>
-            <Link href="/room/create" className="btn btn-primary btn-lg">
-              Create your room
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
-                <path d="M5 12h14M12 5l7 7-7 7" />
-              </svg>
-            </Link>
+            <div className="landing-cta-banner-actions">
+              <Link href="/room/create" className="btn btn-primary btn-lg">
+                Create your room
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
+                  <path d="M5 12h14M12 5l7 7-7 7" />
+                </svg>
+              </Link>
+              <JoinRoomForm compact />
+            </div>
           </div>
         </section>
       </main>

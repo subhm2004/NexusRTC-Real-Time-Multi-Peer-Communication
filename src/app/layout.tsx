@@ -3,8 +3,24 @@ import "./globals.css";
 import { ThemeProvider } from "@/components/ThemeProvider";
 
 export const metadata: Metadata = {
-  title: "NexusRTC",
-  description: "Instant peer-to-peer video calls — no sign-up, no downloads",
+  title: {
+    default: "NexusRTC — Instant Video Calls",
+    template: "%s · NexusRTC",
+  },
+  description:
+    "Peer-to-peer video calls in your browser. No sign-up, password-protected rooms, live chat, screen share, and recording.",
+  keywords: ["video call", "webrtc", "peer-to-peer", "conference", "nexusrtc"],
+  authors: [{ name: "NexusRTC" }],
+  openGraph: {
+    title: "NexusRTC — Instant Video Calls",
+    description: "Create a room, share one link, talk face-to-face in seconds.",
+    type: "website",
+    siteName: "NexusRTC",
+  },
+  icons: {
+    icon: "/favicon.svg",
+    apple: "/favicon.svg",
+  },
 };
 
 export default function RootLayout({

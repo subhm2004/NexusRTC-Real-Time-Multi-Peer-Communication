@@ -8,6 +8,16 @@ const MAX_ROOM_NAME = 50;
 
 export async function POST(request: NextRequest) {
   try {
+    const { getClientIpFromHeaders, rateLimiters } = require("../../../../../lib/rate-limit");
+    const ip = getClientIpFromHeaders(request.headers);
+    const rl = rateLimiters.createRoom.check(ip);
+    if (!rl.allowed) {
+      return NextResponse.json(
+        { error: "Too many rooms created. Try again later." },
+        { status: 429, headers: { "Retry-After": String(rl.retryAfter) } }
+      );
+    }
+
     const body = await request.json();
     const roomName = typeof body.roomName === "string" ? body.roomName.trim() : "";
     const password = typeof body.password === "string" ? body.password.trim() : "";
@@ -34,12 +44,12 @@ export async function POST(request: NextRequest) {
       createSession,
     } = require("../../../../../lib/room-state");
 
-    const created = createRoom(roomId, password, roomName);
+    const created = await createRoom(roomId, password, roomName);
     if (!created) {
       return NextResponse.json({ error: "Could not create room" }, { status: 500 });
     }
 
-    const sessionToken = createSession(roomId);
+    const sessionToken = createSession(roomId, { isHost: true });
 
     return NextResponse.json({
       roomId,

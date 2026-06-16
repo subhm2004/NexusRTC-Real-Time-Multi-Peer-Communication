@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 
 export async function POST(request: NextRequest) {
   try {
+    const { getClientIpFromHeaders, rateLimiters } = require("../../../../../lib/rate-limit");
+    const ip = getClientIpFromHeaders(request.headers);
+
     const body = await request.json();
     const roomId = typeof body.roomId === "string" ? body.roomId.trim() : "";
     const password = typeof body.password === "string" ? body.password : "";
@@ -10,6 +13,14 @@ export async function POST(request: NextRequest) {
 
     if (!roomId) {
       return NextResponse.json({ error: "Room ID required" }, { status: 400 });
+    }
+
+    const rl = rateLimiters.verifyRoom.check(`${ip}:${roomId}`);
+    if (!rl.allowed) {
+      return NextResponse.json(
+        { error: "Too many attempts. Try again later." },
+        { status: 429, headers: { "Retry-After": String(rl.retryAfter) } }
+      );
     }
 
     const {
@@ -25,9 +36,11 @@ export async function POST(request: NextRequest) {
     }
 
     let ok = false;
+    let isHost = false;
     if (creatorToken && verifyCreatorToken(roomId, creatorToken)) {
       ok = true;
-    } else if (password && verifyPassword(roomId, password)) {
+      isHost = true;
+    } else if (password && (await verifyPassword(roomId, password))) {
       ok = true;
     }
 
@@ -35,7 +48,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Invalid password" }, { status: 401 });
     }
 
-    const sessionToken = createSession(roomId);
+    const sessionToken = createSession(roomId, { isHost });
     if (!sessionToken) {
       return NextResponse.json({ error: "Could not start session" }, { status: 500 });
     }

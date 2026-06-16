@@ -1,1143 +1,417 @@
-<div align="center">
-
 # NexusRTC
 
-<img
-  src="https://readme-typing-svg.demolab.com?font=Plus+Jakarta+Sans&weight=600&size=24&duration=2800&pause=900&color=F59E0B&center=true&vCenter=true&repeat=true&width=920&lines=Peer-to-peer+video+conferencing;No+sign-up%2C+one+link+to+join;Mesh+WebRTC+%C2%B7+Room+password+%C2%B7+Live+chat;Screen+share+%C2%B7+Recording+%C2%B7+Hand+raise"
-  alt="Peer-to-peer video conferencing — no sign-up, one link to join"
-/>
+Browser-based peer-to-peer video conferencing. Create a password-protected room, share one link, and meet with camera, chat, screen share, and recording — **no user accounts required**.
 
-<br>
-
-[![Next.js](https://img.shields.io/badge/Next.js-14.2-000000?style=flat&logo=next.js&logoColor=white)](https://nextjs.org/)
-[![React](https://img.shields.io/badge/React-18.3-61dafb?style=flat&logo=react&logoColor=white)](https://react.dev/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![WebRTC](https://img.shields.io/badge/WebRTC-Mesh-e91e63?style=flat)](https://webrtc.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-WebSocket-339933?style=flat&logo=node.js&logoColor=white)](https://nodejs.org/)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker&logoColor=white)](https://www.docker.com/)
-[![License](https://img.shields.io/badge/License-MIT-f59e0b?style=flat)](LICENSE)
-
-<br>
-
-<p>
-  <b>WebRTC</b> &nbsp;·&nbsp; <b>Mesh P2P</b> &nbsp;·&nbsp; <b>Room Password</b> &nbsp;·&nbsp; <b>Live Chat</b> &nbsp;·&nbsp; <b>Screen Share</b> &nbsp;·&nbsp; <b>Recording</b> &nbsp;·&nbsp; <b>Hand Raise</b> &nbsp;·&nbsp; <b>4 Layouts</b>
-</p>
-
-<br>
-
-[Features](#features) · [Quick Start](#quick-start) · [User Journey](#user-journey-end-to-end) · [Architecture](#architecture) · [Protocol](#websocket-protocol-reference) · [Deploy](#production-deployment)
-
-</div>
+Built for small teams and quick calls (2–6 people). Signaling runs over Socket.io; media flows directly between browsers via WebRTC mesh.
 
 ---
 
-## Table of Contents
+## Table of contents
 
-1. [What is NexusRTC?](#what-is-nexusrtc)
-2. [Key Concepts (Read This First)](#key-concepts-read-this-first)
-3. [Features](#features)
-4. [Quick Start](#quick-start)
-5. [User Journey (End-to-End)](#user-journey-end-to-end)
-6. [Tech Stack](#tech-stack)
-7. [Architecture](#architecture)
-8. [Mesh Topology & Scaling](#mesh-topology--scaling)
-9. [Project Structure (Every File Explained)](#project-structure-every-file-explained)
-10. [HTTP Routes & Pages](#http-routes--pages)
-11. [WebSocket Protocol Reference](#websocket-protocol-reference)
-12. [WebRTC Implementation Details](#webrtc-implementation-details)
-13. [Meeting Recording Pipeline](#meeting-recording-pipeline)
-14. [Chat System](#chat-system)
-15. [UI & Design System](#ui--design-system)
-16. [State & Data Model](#state--data-model)
-17. [Sequence Diagrams](#sequence-diagrams)
-18. [Environment Variables](#environment-variables)
-19. [npm Scripts](#npm-scripts)
-20. [Docker](#docker)
-21. [Production Deployment](#production-deployment)
-22. [Reverse Proxy (Nginx / Caddy)](#reverse-proxy-nginx--caddy)
-23. [Browser Support & Permissions](#browser-support--permissions)
-24. [Troubleshooting](#troubleshooting)
-25. [Security](#security)
-26. [FAQ](#faq)
-27. [Roadmap](#roadmap)
-28. [Contributing](#contributing)
-29. [License](#license)
+- [Stack](#stack)
+- [Features](#features)
+- [Quick start](#quick-start)
+- [Environment variables](#environment-variables)
+- [How a room works](#how-a-room-works)
+- [Architecture](#architecture)
+- [API routes](#api-routes)
+- [Socket.io events](#socketio-events)
+- [Deploy](#deploy)
+- [Security](#security)
+- [Scripts](#scripts)
+- [CI](#ci)
+- [Limitations & roadmap](#limitations--roadmap)
+- [License](#license)
 
 ---
 
-## What is NexusRTC?
+## Stack
 
-**NexusRTC** is an open-source browser video calling app. You open the site, click **Start a meeting**, get a unique room URL, share it with friends, and everyone joins with camera and microphone — **without creating an account**.
-
-### What makes it different?
-
-| Aspect | NexusRTC approach |
-|--------|-------------------|
-| **Media path** | **Peer-to-peer (mesh)** — video/audio goes directly between browsers after setup |
-| **Server role** | **Signaling + chat + metadata only** — server never relays video |
-| **Auth** | **Room password** (host sets at create) + session token for WebSockets |
-| **Database** | **None** — all room state lives in memory on the Node process |
-| **Deployment** | **Single long-running Node process** (not serverless) |
-
-### What the server does vs what it does not
-
-| Server **does** | Server **does not** |
-|-----------------|---------------------|
-| Serve Next.js UI (HTML/JS/CSS) | Transcode or relay video streams |
-| Relay WebRTC SDP offers/answers/ICE | Store chat history permanently |
-| Broadcast chat messages to room members | Authenticate users |
-| Push live participant count every 1s | Scale horizontally without extra work |
-
----
-
-## Key Concepts (Read This First)
-
-### 1. Signaling vs media
-
-- **Signaling** = small JSON messages over **WebSocket** (who joined, SDP, ICE candidates).
-- **Media** = encrypted **SRTP** between peers after WebRTC connects.
-- Confusing the two is the #1 mistake when debugging “chat works but video doesn’t.”
-
-### 2. Mesh topology
-
-If **4 people** are in a room, **each browser** maintains **3** `RTCPeerConnection`s (one per other person). Total connections in the room = **N × (N − 1) / 2** = 6.
-
-**Sweet spot:** 4–6 participants. Beyond that, CPU and upload bandwidth on each client grow quickly.
-
-### 3. STUN vs TURN
-
-- **STUN** (included): helps discover public IP through NAT — works for many home networks.
-- **TURN** (not included): relays media when P2P fails (corporate firewalls, symmetric NAT). You must add your own TURN server for hard networks.
-
-### 4. Room link + password
-
-Anyone with the room URL still needs the **password** the host set at creation (unless they are the host with a stored creator token). Room IDs are crypto-random UUIDs from `/room/create`. WebSocket connections require a **session token** from `POST /api/room/verify` or create flow.
+| Layer | Technology |
+|-------|------------|
+| UI | Next.js 14, React 18, TypeScript |
+| Realtime | **Socket.io** (signaling + chat on `/socket.io`) |
+| Media | WebRTC mesh P2P (SRTP) |
+| Server | Custom Node.js (`server.js`) + in-memory room state |
+| Recording | Client `MediaRecorder` → private disk storage → optional FFmpeg MP4 |
+| Auth | Room password (bcrypt) + session tokens + host creator token |
+| Monitoring | Optional Sentry (`NEXT_PUBLIC_SENTRY_DSN`) |
 
 ---
 
 ## Features
 
-### Video & audio
+### Video & audio calling
 
-- Multi-peer video calls (full mesh).
-- **1280×720 @ 30fps** camera capture (configurable in code).
-- Echo cancellation on microphone.
-- Mute/unmute mic and camera from bottom control dock.
-- Local preview mirrored (self-view); remote peers not mirrored.
-- **4 video layouts** — Auto, Grid, Spotlight, Sidebar (saved in `localStorage`).
-- Dynamic grid sizing for 1–6+ participants.
+- **Mesh WebRTC** — each participant connects to every other participant (best for 2–6 people).
+- Camera and microphone with mute / video off controls.
+- **Dynamic ICE config** — client fetches STUN/TURN from `/api/ice-config` at runtime (TURN credentials never baked into the JS bundle).
+- **Participant count** badge in the room nav.
+- **Video layouts** — Auto, Grid, Spotlight, Sidebar (switch from the controls dock).
+- Display names set before joining; names sync across peers.
 
-### In-call controls
+### Waiting room (host-controlled)
 
-- **Floating control dock** — round icon buttons for Mic, Camera, Share, Record, Hand, Layout.
-- **Hand raise** — synced to all peers; ✋ badge on tiles + top banner.
-- **Layout picker** — switch view mode without leaving the call.
+- **On by default** for new rooms — guests land in a lobby until the host admits them.
+- Host sees a **Waiting to join** panel with guest names.
+- **Admit** / **Deny** per guest, or **Admit all** in one click.
+- **Lobby on / Lobby off toggle** in the nav bar (host only):
+  - **Lobby on** — new guests must wait for approval.
+  - **Lobby off** — guests join the call directly.
+  - Turning lobby **off** while guests are queued **auto-admits** everyone waiting.
+- Room-full protection — guests are rejected if `MAX_PEERS` is reached.
 
-### Screen sharing
+### Live chat
 
-- `getDisplayMedia` up to **1920×1080 @ 30fps**.
-- Uses `RTCRtpSender.replaceTrack()` — **no full renegotiation** for most peers.
-- Auto-stops when user ends share from browser UI (`track.onended`).
-- Retries `replaceTrack` at 500ms and 2000ms if sender not ready.
+- Real-time chat over Socket.io (`chat` event), separate from signaling.
+- **End-to-end encryption (E2E)** — AES-256-GCM; key derived with PBKDF2 (100k iterations) from room password + room ID. Server only stores and relays ciphertext.
+- **Chat history on rejoin** — last 200 messages kept in memory per room; sent to participants when they join or are admitted.
+- **Typing indicators** — see who is typing.
+- **Image sharing** — paste or upload images (max **2 MB** client-side).
+- Secure chat UI badge when encryption is active.
+
+### In-call interactions
+
+- **Screen share** — share a tab/window; state synced to all peers; retries on track replacement.
+- **Hand raise** — visible indicator on participant tiles.
+- **Emoji reactions** — floating reactions on video tiles during the call.
+- **Recording indicator** — shows when another participant is recording the meeting.
 
 ### Meeting recording
 
-- Records **entire meeting** as one composited frame (gallery-style layout).
-- Client: offscreen `<canvas>` + `MediaRecorder` (VP9/WebM preferred).
-- Uploads to `POST /api/recordings`.
-- Server: optional **FFmpeg** transcode to H.264/AAC MP4 (Docker image includes FFmpeg).
-- Auto-download in browser when recording stops.
-- **“X is recording”** banner synced to all peers via signaling.
+- Client-side composite recording of the meeting grid (all visible participants in one frame).
+- **Date/time overlay** burned into the video while recording.
+- Upload to server via authenticated `POST /api/recordings`.
+- Files stored in private `data/recordings/` (not served as static files).
+- **Signed one-time download URL** (1-hour TTL) after upload.
+- Optional **FFmpeg** transcode to H.264 MP4 with metadata (title, recorded-at timestamp).
+- Filename format: `NexusRTC-{RoomName}-{YYYY-MM-DD_HH-mm-ss}.webm`
 
-### Chat
+### Reliability & reconnect
 
-- Dedicated WebSocket per room (separate from signaling); requires session `?token=`.
-- Text messages, **typing indicators** (500ms debounce, 3s auto-clear).
-- Emoji picker; image paste/upload as **base64 data URLs**.
-- Optimistic send + dedupe (no duplicate messages on reconnect).
-- Unread dot when panel collapsed.
+- **Socket.io auto-reconnect** — brief disconnects recover without a full page reload.
+- **ICE restart** — on `failed` / `disconnected` peer connection states, offers are re-created with `iceRestart: true`.
+- Reconnecting / connection-failed UI states in the room.
+- Peer connections reset cleanly on socket disconnect.
 
-### Room security
+### Security & production hardening
 
-- **Two-step create flow** — room name → password + confirm.
-- **Password gate** for guests before join (`POST /api/room/verify`).
-- **Session tokens** on all room WebSockets (signaling, chat, viewer).
-- Shared in-memory room store via `global.__NexusRTC_room_state__` (API + `server.js`).
+| Feature | Details |
+|---------|---------|
+| **bcrypt passwords** | Room passwords hashed with bcrypt (12 rounds). Legacy SHA-256 hashes auto-migrate on successful login. |
+| **Session tokens** | UUID issued on verify; required for Socket.io auth and recording upload. Expire after `SESSION_TTL_MS` (default 24h). |
+| **Creator token** | Host-only token stored in browser; used to rejoin as host without re-entering password. Valid while the room exists. |
+| **Rate limiting** | Sliding-window limits on room create, password verify, recording upload, and socket connect (per IP). |
+| **Room TTL** | Empty idle rooms deleted after `ROOM_IDLE_TTL_MS` (default 24h). |
+| **Max peers** | Configurable cap per room (`MAX_PEERS`, default 6). |
+| **Recording auth** | Upload requires valid session token; download requires short-lived signed token. |
+| **TURN support** | Configure via env for corporate WiFi / strict NAT. |
+| **Sentry** | Optional client error reporting. |
 
-### UX
+### Rate limits (defaults)
 
-- Modern **landing page** (hero, features, how-it-works, CTA).
-- **Room page** with glass nav, room name pill, live “in call” count, empty-state panel, polished control dock.
-- **Dark / light theme** — system preference + `localStorage`.
-- Name modal before join; name stored in `localStorage`.
-- One-click **Copy link**.
+| Action | Window | Max attempts |
+|--------|--------|--------------|
+| Create room | 1 hour | 10 per IP |
+| Verify password | 15 minutes | 30 per IP + room |
+| Recording upload | 1 hour | 10 per IP |
+| Socket connect | 1 minute | 40 per IP |
 
-### Technical
+### UI & UX
 
-- Google public **STUN** servers.
-- ICE candidate **queue** until `setRemoteDescription`.
-- **“Lowest peer ID offers”** rule to avoid glare (both sides sending offers).
-- WebSocket **auto-reconnect** (~1s) on signaling drop.
-- Single `server.js` entry: HTTP + WebSocket on one port.
+- Dark / light **theme toggle**.
+- Polished room controls dock (round buttons, layout picker, reaction picker).
+- Password gate before joining; host auto-auth via stored creator token.
+- Waiting-room overlay for guests in the lobby.
+- Responsive video grid with spotlight / sidebar modes.
 
 ---
 
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
-| Requirement | Version / notes |
-|-------------|-----------------|
-| **Node.js** | 18+ (Docker uses 20 Alpine) |
-| **npm** | Comes with Node |
-| **Browser** | Chrome 90+, Firefox 88+, Safari 14+, Edge 90+ |
-| **FFmpeg** | Optional locally; included in Docker for recording MP4 |
+- Node.js 20+
+- npm
+- FFmpeg (optional — enables MP4 conversion after recording upload)
 
-### Install & run (development)
+### Run locally
 
 ```bash
-# Clone
-git clone https://github.com/subhm2004/NexusRTC.git
-cd NexusRTC
-
-# Install dependencies (--legacy-peer-deps required for Next 14 / React 18)
 npm install --legacy-peer-deps
-
-# Start dev server (Next.js HMR + WebSockets on same port)
+cp .env.example .env
 npm run dev
 ```
 
-Wait until you see:
+Open [http://localhost:3000](http://localhost:3000).
 
-```text
-> Ready on http://localhost:3000
-```
+1. **Create a room** — set a name and password.
+2. **Share the room link** — guests enter the same password to join.
+3. As **host**, use the lobby toggle and admit/deny guests as needed.
 
-> **Note:** The **first** compile after install can take **1–3 minutes**. Later restarts are faster.
-
-Open **http://localhost:3000** → **Start a meeting** → allow camera/mic → share the room URL in a second tab/device to test.
-
-### Port already in use?
+If you hit stale Next.js cache issues:
 
 ```bash
-# macOS / Linux — find and kill process on 3000
-lsof -i :3000
-kill <PID>
+npm run dev:fresh
+```
 
-# Or use another port
-PORT=3001 npm run dev
+### Docker
+
+```bash
+docker compose up --build
 ```
 
 ---
 
-## User Journey (End-to-End)
+## Environment variables
 
-```text
-1. User visits /
-   └── Landing page: marketing, features, "Start a meeting"
+Copy [`.env.example`](.env.example) to `.env`.
 
-2. User clicks "Start a meeting" → /room/create
-   └── Step 1: room name
-   └── Step 2: password + confirm → POST /api/room/create
-   └── Redirect to /room/<uuid> (creator token + session in sessionStorage)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `3000` | HTTP server port |
+| `NODE_ENV` | `development` | `production` in deploy |
+| `HOSTNAME` | `0.0.0.0` | Bind address |
+| `TURN_URL` | — | TURN server URL (e.g. `turn:turn.example.com:3478`) |
+| `TURN_USERNAME` | — | TURN username |
+| `TURN_CREDENTIAL` | — | TURN credential |
+| `SESSION_TTL_MS` | `86400000` (24h) | Session token lifetime |
+| `ROOM_IDLE_TTL_MS` | `86400000` (24h) | Delete empty rooms after this idle period |
+| `MAX_PEERS` | `6` | Maximum participants per room |
+| `MAX_RECORDING_MB` | `200` | Max recording upload size |
+| `NEXT_PUBLIC_SENTRY_DSN` | — | Optional Sentry DSN for client errors |
 
-3. /room/<uuid> loads RoomPage
-   └── Guest: password modal → verify API → session token
-   └── Host: auto-verify with creator token
-   └── Name modal (host can set display name)
-   └── Display name saved to localStorage
-
-4. Browser requests getUserMedia (camera + mic)
-   └── On deny: permission banner shown
-
-5. Signaling WebSocket opens: /room/<uuid>/websocket
-   └── Server sends { event: "joined", peerId, peers[] }
-   └── Client sends { event: "set-name", name }
-   └── Server notifies others: { event: "new-peer", ... }
-
-6. WebRTC handshake (per peer pair)
-   └── Lower peerId creates offer → answer → ICE trickle
-   └── Media flows P2P (SRTP)
-
-7. Parallel connections (all with ?token=<sessionToken>)
-   └── Chat WS: /room/<uuid>/chat/websocket
-   └── Viewer count WS: /room/<uuid>/viewer/websocket (count every 1s)
-
-7b. In-call extras
-   └── Hand raise: { event: "hand-raise", raised: true|false } → broadcast hand-raised
-   └── Layout: Auto | Grid | Spotlight | Sidebar (localStorage)
-
-8. User leaves → WS close → peer-left broadcast → others close RTCPeerConnection
-```
+**TURN** is strongly recommended for production — without it, calls may fail on strict corporate networks or symmetric NAT.
 
 ---
 
-## Tech Stack
+## How a room works
 
-| Layer | Technology | Purpose |
-|-------|------------|---------|
-| **UI** | Next.js 14 App Router, React 18, TypeScript 5 | Pages, components, API routes |
-| **Styling** | Plain CSS + CSS variables | Themes, landing, room UI — no Tailwind |
-| **Runtime** | Node.js | Custom HTTP server |
-| **Realtime** | `ws` package | WebSocket signaling, chat, viewer count |
-| **Media** | WebRTC APIs | P2P audio/video/screen |
-| **NAT** | Google STUN | ICE candidate gathering |
-| **Recording** | MediaRecorder + Canvas + FFmpeg (optional) | Client capture, server transcode |
-| **Deploy** | Docker Compose, Node 20 Alpine | Production image with FFmpeg |
+### Creating a room
 
-### Dependencies (`package.json`)
+1. Host submits room name + password via `POST /api/room/create`.
+2. Server creates an in-memory room with:
+   - bcrypt password hash
+   - creator token (host identity)
+   - waiting room **enabled** by default
+   - empty peer list, waiting queue, and chat history
+3. Creator token and session token are stored in the browser (`sessionStorage`).
 
-| Package | Version | Role |
-|---------|---------|------|
-| `next` | 14.2.18 | React framework, build, API routes |
-| `react` / `react-dom` | ^18.3 | UI |
-| `ws` | ^8.18 | WebSocket server |
-| `typescript` | ^5 | Type checking (dev) |
+### Joining as a guest
+
+1. Guest opens the room link and enters the password.
+2. `POST /api/room/verify` checks the password → returns a **session token**.
+3. Client opens a Socket.io connection with `{ roomId, token }`.
+4. If **lobby is on** and the user is not the host → guest enters the **waiting room**.
+5. Host admits → guest receives `admitted` and WebRTC negotiation begins.
+6. If **lobby is off** → guest joins the call immediately.
+
+### Joining as host (return visit)
+
+- If a **creator token** is still in the browser and the room exists, the client auto-verifies and gets a fresh session token — no password prompt.
+- Host privileges (lobby toggle, admit/deny) come from the `isHost` flag on the session.
+
+### Tokens explained
+
+| Token | Lifetime | Purpose |
+|-------|----------|---------|
+| **Session token** | `SESSION_TTL_MS` (default 24h) | Socket.io auth, recording upload |
+| **Creator token** | Until room is deleted | Host rejoin without password |
+| **Recording download token** | 1 hour, one-time use | Secure file download |
+
+Session tokens are checked at **socket connect time**. An active call is not interrupted mid-session if the token expires, but reconnect or page refresh will require a new verify.
 
 ---
 
 ## Architecture
 
-### High-level diagram
-
-```mermaid
-flowchart TB
-  subgraph BrowserA["Browser — Peer A"]
-    UI_A["React UI"]
-    PC_A["RTCPeerConnection × N-1"]
-    Media_A["getUserMedia / getDisplayMedia"]
-    UI_A --> PC_A
-    Media_A --> PC_A
-  end
-
-  subgraph BrowserB["Browser — Peer B"]
-    UI_B["React UI"]
-    PC_B["RTCPeerConnection × N-1"]
-    Media_B["getUserMedia / getDisplayMedia"]
-    UI_B --> PC_B
-    Media_B --> PC_B
-  end
-
-  subgraph Server["server.js — single process"]
-    Next["Next.js HTTP handler"]
-    WSS["WebSocketServer ws"]
-    Mem[("In-memory rooms Map")]
-    Next --- WSS
-    WSS --> Mem
-  end
-
-  subgraph STUN["Google STUN"]
-    STUN1["stun.l.google.com:19302"]
-    STUN2["stun1.l.google.com:19302"]
-  end
-
-  UI_A <-->|WS signaling chat viewer| WSS
-  UI_B <-->|WS signaling chat viewer| WSS
-  PC_A <-. ICE .-> STUN1
-  PC_B <-. ICE .-> STUN2
-  PC_A <-->|SRTP media P2P| PC_B
+```
+Browser A ←—— WebRTC media (SRTP, mesh) ——→ Browser B
+    │                                         │
+    └———— Socket.io (/socket.io) ————————————┘
+                        │
+              server.js + lib/socket-handlers.js
+                        │
+              lib/room-state.js (in-memory Map)
+                        │
+              Next.js API routes (/api/*)
 ```
 
-### Process model
+### Data flow
 
-```text
-node server.js
-├── next({ dev | production })
-├── http.createServer → app.getRequestHandler()  // all HTTP (pages, /api/*, static)
-├── WebSocketServer { noServer: true }
-└── server.on('upgrade') → route by pathname
-```
+| Path | What travels |
+|------|--------------|
+| WebRTC | Audio/video/screen — **peer to peer**, never through the server |
+| Socket.io `signaling` | SDP offers/answers, ICE candidates, presence, reactions, waiting room |
+| Socket.io `chat` | Chat messages (plaintext or E2E ciphertext) |
+| `/api/recordings` | Recording blob upload (session-authenticated) |
+| `/api/ice-config` | STUN + TURN server list |
 
-**Important:** You cannot deploy on **Vercel serverless** alone — WebSockets need a persistent Node process.
+Room state (peers, waiting queue, sessions, chat history, settings) lives in a **single Node process** global Map — shared between `server.js` and Next.js API routes.
 
 ---
 
-## Mesh Topology & Scaling
+## API routes
 
-### Connection count
+| Route | Method | Auth | Description |
+|-------|--------|------|-------------|
+| `/api/room/create` | POST | Rate limit | Create room → `{ roomId, creatorToken }` |
+| `/api/room/verify` | POST | Rate limit | Password or creator token → `{ sessionToken }` |
+| `/api/room/[uuid]/status` | GET | — | `{ exists, roomName }` |
+| `/api/ice-config` | GET | — | `{ iceServers: RTCIceServer[] }` |
+| `/api/recordings` | POST | Session token | Upload recording WebM; returns download URL |
+| `/api/recordings/download` | GET | One-time token | Download recording file |
+| `/api/health` | GET | — | Health check for deploy probes |
 
-| Peers (N) | Connections per peer | Total connections in room |
-|-----------|----------------------|---------------------------|
-| 2 | 1 | 1 |
-| 3 | 2 | 3 |
-| 4 | 3 | 6 |
-| 5 | 4 | 10 |
-| 6 | 5 | 15 |
+### Create room body
 
-### Bandwidth (rough estimate)
+```json
+{ "roomName": "Team standup", "password": "secret1234" }
+```
 
-Each peer **sends** one upstream per remote viewer (mesh). For 720p30, plan **~1–3 Mbps upload per remote peer** depending on codec/congestion. At 5 peers, one user might need **4× upload** — fine on fiber, painful on weak Wi‑Fi.
+### Verify room body
 
-### When to move to SFU
+```json
+{ "roomId": "uuid", "password": "secret1234" }
+```
 
-Consider **mediasoup**, **LiveKit**, or **Janus** when you need:
+Host rejoin:
 
-- 8+ participants reliably
-- Server-side recording without client composite
-- Simulcast / adaptive bitrate per subscriber
+```json
+{ "roomId": "uuid", "creatorToken": "..." }
+```
 
 ---
 
-## Project Structure (Every File Explained)
+## Socket.io events
 
-```text
-NexusRTC/
-├── server.js                    # ENTRYPOINT — HTTP + WebSocket upgrade routing
-├── lib/
-│   └── room-state.js            # In-memory room registry, chat broadcast, viewer tick
-├── src/
-│   ├── app/
-│   │   ├── layout.tsx           # Root HTML, fonts (Plus Jakarta Sans), ThemeProvider
-│   │   ├── page.tsx             # Landing page (hero, features, steps, CTA)
-│   │   ├── globals.css          # Design tokens, landing + room + chat + video styles
-│   │   ├── api/
-│   │   │   └── recordings/
-│   │   │       └── route.ts     # POST upload WebM → optional FFmpeg → MP4
-│   │   └── room/
-│   │       ├── create/
-│   │       │   └── page.tsx     # redirect(/room/${randomUUID()})
-│   │       └── [uuid]/
-│   │           └── page.tsx     # Server: build roomLink, render <RoomPage />
-│   └── components/
-│       ├── RoomPage.tsx         # WebRTC, signaling, recording, layouts, hand raise
-│       ├── room/RoomControlsDock.tsx  # Mic, cam, share, record, hand, layout UI
-│       ├── Chat.tsx             # Chat WebSocket client
-│       ├── StreamPage.tsx       # Viewer-oriented variant (partial / legacy stream API)
-│       ├── ThemeProvider.tsx    # Applies data-theme on <html>
-│       └── ThemeToggle.tsx      # Dark/light toggle button
-├── public/
-│   └── recordings/              # Saved meeting files (gitignored in practice)
-├── Dockerfile                   # node:20-alpine + ffmpeg + npm run build
-├── docker-compose.yml           # Single service on port 3000
-├── next.config.js               # reactStrictMode: true
-├── tsconfig.json                # Path alias @/* → src/*
-├── package.json
-└── README.md
-```
-
-### `server.js` (detailed)
-
-| Responsibility | Detail |
-|----------------|--------|
-| Boot Next.js | `next({ dev, hostname, port })` then `app.prepare()` |
-| HTTP | Delegates to Next handler for all non-WS requests |
-| WS upgrade | Parses pathname; destroys socket if no match |
-| Room signaling | Creates `peerId` (UUID), handles `set-name`, relays offer/answer/candidate |
-| Recording sync | `recording-started` / `recording-stopped` broadcast |
-| Chat | Adds socket to `room.hub.clients`, broadcasts raw messages |
-| Viewer | Adds socket to `room.viewerSockets`, pushes count on interval |
-
-### `lib/room-state.js` (detailed)
-
-| Export | Purpose |
-|--------|---------|
-| `getOrCreateRoom(uuid)` | Creates `{ peers, hub, viewerSockets }` if missing |
-| `getRoomByUuid(uuid)` | Returns room or null |
-| `broadcastChat(hub, message)` | Sends string to all chat clients in room |
-| `startViewerCountInterval()` | Every **1000ms**, sends `room.peers.size` to viewer sockets |
-| `rooms` / `streams` | Internal Maps (also `sha256` stream index for future stream URLs) |
-
-**Room object shape:**
+Connect with auth:
 
 ```js
-{
-  roomName: string,
-  passwordHash: string,
-  creatorToken: string,
-  sessions: Set<sessionToken>,
-  peers: Map<peerId, { ws, name, isViewer, handRaised }>,
-  hub: { clients: Set<WebSocket> },
-  viewerSockets: Set<WebSocket>,
-  recordingPeer: { peerId, name } | null
-}
+io("/", { auth: { roomId: "...", token: "session-token" } })
 ```
 
-### `src/components/RoomPage.tsx` (detailed)
+### Signaling (`signaling` event)
 
-| Area | Lines / concepts |
-|------|------------------|
-| `RemoteVideo` | Binds `MediaStream` to `<video>`, handles `addtrack`/`removetrack` |
-| `createMeetingCompositeStream` | Canvas grid + mixed audio for recording |
-| `NameInputModal` | Pre-join name gate |
-| `ICE` config | STUN servers (add TURN here) |
-| `createOfferTo` | Mesh offer side + `ontrack` stream merging |
-| Signaling `useEffect` | WS message switch: joined, new-peer, offer, answer, candidate, peer-left |
-| Media | `getUserMedia`, screen share, `replaceTrack` |
-| Recording | MediaRecorder → FormData → `/api/recordings` |
+| Event | Direction | Description |
+|-------|-----------|-------------|
+| `set-name` | client → server | Set display name |
+| `joined` | server → client | Active in call; includes peer list, recording state, lobby setting |
+| `waiting-room` | server → client | Guest queued in lobby |
+| `admitted` | server → client | Host approved — join call |
+| `rejected` | server → client | Host denied — disconnect |
+| `room-full` | server → client | Max peers reached |
+| `waiting-peer` | server → host | New guest in lobby |
+| `waiting-peer-updated` | server → host | Guest updated name |
+| `waiting-peer-left` | server → host | Guest left lobby |
+| `admit-guest` | host → server | Admit one guest by ID |
+| `admit-all-guests` | host → server | Admit everyone waiting |
+| `reject-guest` | host → server | Deny guest |
+| `waiting-room-toggle` | host → server | `{ enabled: boolean }` — turn lobby on/off |
+| `waiting-room-updated` | server → clients | Lobby setting changed |
+| `new-peer` | server → clients | Someone joined the call |
+| `peer-left` | server → clients | Someone left |
+| `offer` / `answer` / `candidate` | peer ↔ peer (relayed) | WebRTC negotiation |
+| `hand-raise` / `hand-raised` | client ↔ peers | Hand raise state |
+| `screen-share` | client ↔ peers | Screen share active/inactive |
+| `reaction` | client ↔ peers | Emoji reaction on tile |
+| `recording-started` / `recording-stopped` | client ↔ peers | Recording state broadcast |
 
-### `src/components/Chat.tsx`
+### Chat (`chat` event)
 
-| Feature | Implementation |
-|---------|----------------|
-| Connect | `new WebSocket(wsUrl)` when `wsUrl` set |
-| Send text | `{ n, m }` JSON |
-| Typing | `{ type: "typing", n }` debounced 500ms |
-| Images | `{ type: "image", n, url }` base64 |
-| Name edit | Click “You: name” in header → inline input |
+| Payload type | Description |
+|--------------|-------------|
+| `message` | Text chat (optionally E2E encrypted envelope `{ e: 1, c: "..." }`) |
+| `image` | Image data URL |
+| `typing` | Typing indicator |
+| `history` | Server sends stored messages on join |
+
+### Other
+
+| Event | Description |
+|-------|-------------|
+| `viewer:count` | Live participant count |
 
 ---
 
-## HTTP Routes & Pages
+## Deploy
 
-| Route | Type | Description |
-|-------|------|-------------|
-| `/` | Static page | Landing / marketing |
-| `/room/create` | Client page | Room name + password → `POST /api/room/create` |
-| `/room/[uuid]` | Dynamic page | Video room (`RoomPage`) |
-| `POST /api/room/create` | API | Create room (password hash, creator token) |
-| `POST /api/room/verify` | API | Verify password → session token |
-| `GET /api/room/[uuid]/status` | API | Room exists, name, peer count |
-| `POST /api/recordings` | API | Upload recording blob |
-| `GET /recordings/<file>` | Static | Files in `public/recordings/` |
+### Render
 
-### `POST /api/recordings`
+Use the included [`render.yaml`](render.yaml) blueprint. In the Render dashboard, also set:
 
-**Request:** `multipart/form-data`
+- `TURN_URL`, `TURN_USERNAME`, `TURN_CREDENTIAL`
+- `NEXT_PUBLIC_SENTRY_DSN` (optional)
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `file` | Blob/File | Yes | WebM recording from browser |
-| `roomId` | string | No | Used in filename sanitization |
+Health check: `/api/health`
 
-**Response (success, FFmpeg OK):**
+### Important deploy notes
 
-```json
-{
-  "url": "/recordings/recorded-meeting-<room>-<timestamp>.mp4",
-  "filename": "recorded-meeting-....mp4",
-  "compressed": true,
-  "message": "Recording saved and compressed successfully"
-}
-```
-
-**Response (FFmpeg missing/failed):**
-
-```json
-{
-  "url": "/recordings/recorded-meeting-<room>-<timestamp>.webm",
-  "compressed": false,
-  "message": "Recording saved (FFmpeg unavailable or failed, using original)"
-}
-```
-
-**FFmpeg args used:** `libx264`, `crf 23`, `preset fast`, `aac 128k`, `+faststart`.
-
----
-
-## WebSocket Protocol Reference
-
-All WebSockets use the **same host and port** as the website. Use `wss://` when the site is served over HTTPS.
-
-### Endpoints (per room `uuid`)
-
-| Path | Direction | Purpose |
-|------|-----------|---------|
-| `/room/:uuid/websocket?token=` | Bidirectional | WebRTC signaling + room events |
-| `/room/:uuid/chat/websocket?token=` | Bidirectional | Chat fan-out (sender excluded from echo) |
-| `/room/:uuid/viewer/websocket?token=` | Server → client | Participant count every ~1s |
-
-> All room WebSockets require a valid **session token** query param. Unauthorized connections close with code `4001`.
-
-### Signaling — client → server
-
-```jsonc
-// REQUIRED after connect — before others see you in the room
-{ "event": "set-name", "name": "Alice" }
-
-// WebRTC relay (server forwards to peer `to`)
-{ "to": "<peerId>", "event": "offer",     "data": "<JSON string of RTCSessionDescription>" }
-{ "to": "<peerId>", "event": "answer",    "data": "<JSON string of RTCSessionDescription>" }
-{ "to": "<peerId>", "event": "candidate", "data": "<JSON string of RTCIceCandidate>" }
-
-// Recording awareness
-{ "event": "recording-started", "name": "Alice" }
-{ "event": "recording-stopped" }
-
-// Hand raise (broadcast to others)
-{ "event": "hand-raise", "raised": true }
-```
-
-### Signaling — server → client
-
-```jsonc
-// On connect
-{
-  "event": "joined",
-  "peerId": "<your-uuid>",
-  "peers": [{ "id": "...", "name": "Bob", "handRaised": false }],
-  "viewer": false,
-  "recordingPeer": { "peerId": "...", "name": "..." } | null
-}
-
-// After another peer sets name (first time)
-{ "event": "new-peer", "peerId": "...", "name": "Carol", "viewer": false }
-
-// Name change (after initial set-name)
-{ "event": "peer-name-updated", "peerId": "...", "name": "Carol Updated" }
-
-// Relayed WebRTC
-{ "event": "offer" | "answer" | "candidate", "from": "<peerId>", "data": "..." }
-
-// Peer disconnect
-{ "event": "peer-left", "peerId": "..." }
-
-// Recording
-{ "event": "recording-started", "peerId": "...", "name": "Alice" }
-{ "event": "recording-stopped", "peerId": "..." }
-
-// Hand raise
-{ "event": "hand-raised", "peerId": "...", "raised": true }
-```
-
-### Chat — client → server (broadcast to all in room)
-
-```jsonc
-// Text
-{ "n": "Alice", "m": "Hello everyone!" }
-
-// Typing indicator
-{ "type": "typing", "n": "Alice" }
-
-// Image (base64 data URL — keep images small)
-{ "type": "image", "n": "Alice", "url": "data:image/png;base64,..." }
-```
-
-### Viewer WebSocket
-
-- Server sends plain text: `"1"`, `"2"`, … = number of peers in `room.peers` Map.
-- Updated every **1000ms** via `startViewerCountInterval()`.
-
----
-
-## WebRTC Implementation Details
-
-### ICE servers (default)
-
-```typescript
-// src/components/RoomPage.tsx
-const ICE = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun1.l.google.com:19302" },
-  ],
-};
-```
-
-### Media constraints (default)
-
-```typescript
-getUserMedia({
-  video: { width: { max: 1280 }, height: { max: 720 }, frameRate: 30 },
-  audio: { echoCancellation: true },
-});
-```
-
-### Offer/answer glare avoidance
-
-When peer B joins, both sides compare IDs:
-
-- If `myId < peerId` → **I am offerer** (`createOffer`).
-- Else → **I wait for offer** and respond with `answer`.
-
-This prevents duplicate offers crashing negotiation.
-
-### ICE candidate queue
-
-If `addIceCandidate` arrives before `setRemoteDescription`, candidates are stored in `candidateQueueRef` per peer and flushed after remote description is set.
-
-### Screen share
-
-1. `getDisplayMedia({ video: { width: 1920, height: 1080 }, audio: false })`
-2. For each `RTCPeerConnection`, find video `RTCRtpSender` → `replaceTrack(screenTrack)`
-3. On `track.onended` → restore camera track
-
-### Reconnection
-
-Signaling WebSocket reconnects after close (~1s). Full page refresh may be needed if state is inconsistent after long disconnect.
-
----
-
-## Meeting Recording Pipeline
-
-```mermaid
-flowchart LR
-  A[All participant streams] --> B[Offscreen canvas composite]
-  B --> C[MediaRecorder WebM/VP9]
-  C --> D[POST /api/recordings]
-  D --> E{FFmpeg installed?}
-  E -->|Yes| F[MP4 H.264 AAC]
-  E -->|No| G[Keep WebM]
-  F --> H[public/recordings/]
-  G --> H
-  H --> I[Browser auto-download]
-```
-
-| Step | Detail |
-|------|--------|
-| Composite | 1280×720 canvas; grid layout by participant count |
-| Audio | Mixed via `AudioContext` + `MediaStreamDestination` |
-| Codec | `video/webm;codecs=vp9` preferred, fallback `video/webm` |
-| Upload | `FormData`: `file`, `roomId` |
-| Notify peers | `recording-started` / `recording-stopped` on signaling WS |
-
----
-
-## Chat System
-
-| Constant | Value |
-|----------|-------|
-| `CHAT_NAME_KEY` | `nexus-chat-name` (localStorage) |
-| Typing debounce | 500ms |
-| Typing display timeout | 3000ms |
-
-Chat is **not end-to-end encrypted**. Messages are visible to the server process and all clients in the room. Use **HTTPS** in production so transport is encrypted.
-
-| Behavior | Detail |
-|----------|--------|
-| Send path | Optimistic UI append + server broadcast (excludes sender socket) |
-| Reconnect | Connection generation guard — no duplicate sockets on token URL change |
-| Dedupe | Recent message keys prevent double display on edge cases |
-
----
-
-## UI & Design System
-
-### Themes
-
-- Attribute: `data-theme="dark"` | `data-theme="light"` on `<html>`
-- Storage key: `nexus-theme`
-- Font: **Plus Jakarta Sans** (Google Fonts)
-
-### CSS variables (excerpt)
-
-| Token | Purpose |
-|-------|---------|
-| `--bg`, `--bg-elevated` | Surfaces |
-| `--accent` | Amber primary CTA |
-| `--accent-secondary`, `--accent-violet` | Gradients |
-| `--text`, `--text-muted` | Typography |
-| `--radius`, `--radius-lg`, `--radius-full` | Corners |
-
-### Pages
-
-| Page | Classes | Notes |
-|------|---------|-------|
-| Landing | `.landing`, `.landing-hero`, … | Marketing layout |
-| Room | `.room-page`, `.room-nav`, `.room-stage`, `.room-controls-dock` | Call UI |
-| Modal | `.name-modal-room` | Join gate |
-
-### Room UI layout
-
-```text
-┌─────────────────────────────────────────────────────────┐
-│ room-nav: Logo | Room ID | N in call | Copy | Theme | Leave │
-├─────────────────────────────────────────────────────────┤
-│ room-stage                                              │
-│  ┌──────────────────────┐  ┌─────────────────────┐   │
-│  │ video-grid (tiles)   │  │ room-empty-panel    │   │
-│  │                      │  │ (when alone)        │   │
-│  └──────────────────────┘  └─────────────────────┘   │
-├─────────────────────────────────────────────────────────┤
-│  [Mic][Cam][Share][Rec] | [Hand][Layout]  Name          │  ← round icon dock
-│                                    [ Chat panel ]      │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Video layouts** (Layout button in dock):
-
-| Mode | Description |
-|------|-------------|
-| **Auto** | Grid adapts to participant count (default) |
-| **Grid** | Equal tiles, `auto-fill` columns |
-| **Spotlight** | Large primary remote + filmstrip of others |
-| **Sidebar** | Main video left, thumbnails right |
-
-Stored in `localStorage` key `nexus-video-layout`.
-
----
-
-## State & Data Model
-
-### Server memory (volatile)
-
-- Lost on process restart.
-- Not shared across multiple Node instances.
-- Rooms never auto-expire (grow until process restart — consider TTL for production).
-
-### Client (`RoomPage`)
-
-| State / ref | Purpose |
-|-------------|---------|
-| `userName` | Display name |
-| `videoLayout` | `auto` \| `grid` \| `spotlight` \| `sidebar` |
-| `raisedHands` / `isHandRaised` | Hand-raise sync across peers |
-| `remoteStreams` | `peerId → MediaStream` for tiles |
-| `peerNames` | `peerId → string` |
-| `peersRef` | `peerId → RTCPeerConnection` |
-| `candidateQueueRef` | Pending ICE per peer |
-| `localStreamRef` / `screenStreamRef` | Media sources |
-| `wsRef` | Signaling WebSocket |
-
-### localStorage keys
-
-| Key | Used by |
-|-----|---------|
-| `nexus-theme` | ThemeToggle |
-| `nexus-chat-name` | RoomPage name modal + Chat |
-| `nexus-video-layout` | Room video layout preference |
-| `nexus-room-session-<uuid>` | Session token (sessionStorage) |
-| `nexus-room-creator-<uuid>` | Creator token (sessionStorage) |
-
----
-
-## Sequence Diagrams
-
-### Room join + WebRTC handshake
-
-```mermaid
-sequenceDiagram
-  participant A as Alice
-  participant S as Signaling server
-  participant B as Bob
-
-  A->>A: getUserMedia
-  A->>S: connect WS
-  S-->>A: joined + peerId
-  A->>S: set-name Alice
-
-  B->>B: getUserMedia
-  B->>S: connect WS
-  S-->>B: joined + peers include Alice
-  B->>S: set-name Bob
-  S-->>A: new-peer Bob
-
-  Note over A,B: Smaller peerId sends offer
-  A->>S: offer → B
-  S-->>B: offer from A
-  B->>S: answer → A
-  S-->>A: answer from B
-  par ICE
-    A->>S: candidates
-    S-->>B: candidates
-    B->>S: candidates
-    S-->>A: candidates
-  end
-  A-->>B: SRTP media P2P
-```
-
-### Chat message flow
-
-```mermaid
-sequenceDiagram
-  participant A as Alice
-  participant H as Chat hub
-  participant B as Bob
-
-  A->>H: { n, m } hello
-  H-->>A: echo
-  H-->>B: broadcast
-```
-
-### Screen share (replaceTrack)
-
-```mermaid
-sequenceDiagram
-  participant U as User
-  participant L as RoomPage
-  participant P as Peer connections
-
-  U->>L: Share screen
-  L->>L: getDisplayMedia
-  loop Each PC
-    L->>P: replaceTrack(screen)
-  end
-  Note over P: No full renegotiation
-  U->>L: Stop share
-  L->>P: replaceTrack(camera)
-```
-
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3000` | HTTP + WebSocket listen port |
-| `NODE_ENV` | `development` | `production` for optimized Next build |
-
-Example:
-
-```bash
-PORT=8080 NODE_ENV=production npm start
-```
-
----
-
-## npm Scripts
-
-| Script | Command | Description |
-|--------|---------|-------------|
-| `dev` | `node server.js` | Development (Next dev mode) |
-| `build` | `next build` | Production bundle to `.next/` |
-| `start` | `NODE_ENV=production node server.js` | Production server |
-| `lint` | `next lint` | ESLint |
-| `clean` | `rm -rf .next` | Clear Next cache |
-| `reinstall` | wipe + `npm install --legacy-peer-deps` | Full reset |
-
-### Production build locally
-
-```bash
-npm run build
-npm start
-```
-
----
-
-## Docker
-
-### Docker Compose (recommended)
-
-```bash
-docker compose up --build        # foreground
-docker compose up -d --build     # detached
-docker compose down
-```
-
-### Dockerfile highlights
-
-- Base: `node:20-alpine`
-- Installs **FFmpeg** for recording compression
-- Runs `npm run build` then `CMD ["node", "server.js"]`
-- Exposes port **3000**
-
-### Plain Docker
-
-```bash
-docker build -t nexus-rtc .
-docker run -p 3000:3000 nexus-rtc
-```
-
----
-
-## Production Deployment
-
-### Supported platforms
-
-| Platform | Works? | Notes |
-|----------|--------|-------|
-| VPS / EC2 / Droplet | ✅ | Best control; Nginx + TLS |
-| Railway / Render / Fly.io | ✅ | Deploy Docker image; enable WebSockets |
-| DigitalOcean App Platform | ✅ | Enable WebSocket health checks |
-| Heroku (container) | ✅ | Single dyno; no horizontal scale without backplane |
-| **Vercel serverless** | ❌ | No persistent WebSocket server |
-
-### Single-instance rule
-
-**Do not run multiple replicas** without Redis/NATS pub-sub for signaling. Room state is in-process memory — peers in the same room must hit the **same** Node instance.
-
-### Production checklist
-
-- [ ] **HTTPS** (required for camera/mic off localhost)
-- [ ] `NODE_ENV=production`
-- [ ] Reverse proxy forwards `Upgrade` + `Connection` headers
-- [ ] WebSocket read timeout ≥ 3600s (long calls)
-- [ ] Optional: **TURN** server for corporate users
-- [ ] Optional: rate limits + max peers per room
-- [ ] Optional: cron to prune `public/recordings/`
-
----
-
-## Reverse Proxy (Nginx / Caddy)
-
-### Nginx
-
-```nginx
-upstream nexus {
-  server 127.0.0.1:3000;
-}
-
-server {
-  listen 443 ssl http2;
-  server_name calls.example.com;
-
-  ssl_certificate     /path/to/fullchain.pem;
-  ssl_certificate_key /path/to/privkey.pem;
-
-  location / {
-    proxy_pass http://nexus;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_read_timeout 3600s;
-    proxy_send_timeout 3600s;
-  }
-}
-```
-
-`X-Forwarded-Proto` is used in `room/[uuid]/page.tsx` to build correct `roomLink` for sharing.
-
-### Caddy
-
-```caddy
-calls.example.com {
-  reverse_proxy localhost:3000
-}
-```
-
----
-
-## Browser Support & Permissions
-
-| Browser | Min version | Notes |
-|---------|-------------|-------|
-| Chrome / Edge | 90+ | Recommended |
-| Firefox | 88+ | Full support |
-| Safari | 14+ | iOS: one camera tab at a time |
-| Opera | 76+ | Chromium-based |
-
-| Permission | API | When |
-|------------|-----|------|
-| Camera + mic | `getUserMedia` | On room join |
-| Screen | `getDisplayMedia` | User clicks Share |
-
----
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `EADDRINUSE` port 3000 | Old `node server.js` still running | `lsof -i :3000` → `kill <PID>` |
-| Stuck on “Compiling / …” | First Next.js compile slow | Wait 2–3 min; or `npm run clean && npm run dev` |
-| Permission denied camera | HTTP on non-localhost | Use HTTPS or localhost |
-| See self, not remote | ICE failed or signaling down | Check WS in DevTools; add TURN |
-| Chat works, no video | Signaling WS blocked separately | Fix proxy/firewall for `/room/*/websocket` |
-| Screen share not visible | PC not `connected` yet | Wait; retries at 500ms/2000ms |
-| Recording stays WebM | FFmpeg not installed | Install FFmpeg or use Docker image |
-| Build fails on `.nft.json` | Corrupt `.next` cache | `npm run clean && npm run build` |
-
-### Add TURN server
-
-Edit `ICE` in `src/components/RoomPage.tsx`:
-
-```typescript
-const ICE = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    {
-      urls: "turn:turn.example.com:3478",
-      username: "user",
-      credential: "pass",
-    },
-  ],
-};
-```
+- **Single instance only** — room state is in-memory. Running multiple replicas without Redis will split rooms across processes.
+- **Recordings on disk** — on ephemeral hosts (e.g. Render free tier), files are lost on redeploy. For production, plan S3/R2 or persistent volume storage.
+- **FFmpeg** — include in your Docker image if you want automatic MP4 conversion.
 
 ---
 
 ## Security
 
-| Topic | Status |
-|-------|--------|
-| Authentication | **None** — URL secrecy only |
-| Media encryption | **SRTP** between peers (WebRTC default) |
-| Signaling | Plain JSON over WS — use **WSS** in production |
-| Chat | **Not E2E** — server can read messages |
-| Names | User-chosen, not verified |
-| Recordings | Saved on server disk under `public/recordings/` |
-| Chat images | Base64 inline — risk of large payloads; add size limits |
-| DoS | Unbounded rooms/peers in memory — add limits for public deploy |
+- Passwords hashed with **bcrypt** (12 rounds); legacy SHA-256 auto-upgrades on login.
+- Session tokens expire (`SESSION_TTL_MS`); checked on socket connect and recording upload.
+- Rate limits on create, verify, upload, and socket connect.
+- Recordings stored outside `public/` with **signed one-time download tokens**.
+- Chat E2E: server relays ciphertext only; decryption key derived from room password client-side.
+- TURN credentials fetched server-side via `/api/ice-config` — not embedded in client bundle.
 
 ---
 
-## FAQ
+## Scripts
 
-**Q: Do I need to create an account?**  
-A: No. Share the room link and anyone with it can join.
-
-**Q: Does video go through your server?**  
-A: No. After signaling, media flows directly between browsers (WebRTC mesh). The server only relays SDP and ICE messages.
-
-**Q: How many people can join one room?**  
-A: There is no hard cap in code, but mesh works best with **4–6** participants. Larger groups need an SFU architecture.
-
-**Q: Does it work on mobile?**  
-A: Yes on modern mobile browsers. iOS Safari has extra limits (e.g. one camera tab at a time, background tabs may pause media).
-
-**Q: Where are recordings stored?**  
-A: On the server under `public/recordings/` after upload. Lock down or remove this directory in production if you do not want public file access.
-
-**Q: Can I deploy on Vercel?**  
-A: Not as serverless-only. You need the full `server.js` process (VPS, Docker, Railway, Render, Fly.io, etc.) for WebSockets.
-
-**Q: Do room links expire?**  
-A: No automatic expiry. A room exists in memory while the server is running. Restarting the server clears all rooms — create a new room after restart.
-
-**Q: I have the link and password but see “Room not found”?**  
-A: Restart `npm run dev` and **create a new room**. Room state is in-memory; after a server restart old rooms are gone.
-
-**Q: How do video layouts work?**  
-A: Click **Layout** in the bottom dock. Choose Auto, Grid, Spotlight, or Sidebar. Your choice is saved in `localStorage` for next visits.
+| Command | Description |
+|---------|-------------|
+| `npm run dev` | Development server (Next.js + Socket.io) |
+| `npm run dev:fresh` | Delete `.next` cache, then dev |
+| `npm run build` | Production build |
+| `npm start` | Production server |
+| `npm run lint` | ESLint |
 
 ---
 
-## Roadmap
+## CI
 
-- [ ] TURN (`coturn`) in `docker-compose.yml`
-- [x] Room passwords + session tokens for WebSockets
-- [x] Video layouts (Auto / Grid / Spotlight / Sidebar)
-- [x] Hand raise + polished control dock
-- [ ] SFU mode for 8+ participants
-- [ ] Persistent chat (Redis/SQLite + TTL)
-- [ ] Server-side recording (headless Chromium)
-- [ ] PWA install prompts
-- [ ] Virtual backgrounds (MediaPipe)
-- [ ] E2E encrypted chat
+GitHub Actions (`.github/workflows/ci.yml`) on push/PR to `main` / `master`:
+
+1. `npm ci --legacy-peer-deps`
+2. `npx tsc --noEmit`
+3. `npm run build`
 
 ---
 
-## Contributing
+## Limitations & roadmap
 
-The codebase is small enough to understand in one session. Start with:
+### Current limitations
 
-1. `server.js` — WebSocket routing  
-2. `lib/room-state.js` — room memory  
-3. `src/components/RoomPage.tsx` — WebRTC client  
+| Limitation | Detail |
+|------------|--------|
+| Mesh topology | CPU and upload bandwidth grow with each participant — practical cap ~6 |
+| In-memory state | Rooms, sessions, and chat history lost on server restart |
+| Single process | No horizontal scaling without Redis or similar |
+| No TURN by default | Must configure env vars for strict NAT / corporate networks |
+| E2E chat key | Requires room password in browser session; clearing storage without re-entering password breaks decryption |
+| No kick / lock room | Host can deny in lobby but cannot remove active participants yet |
+| Recording storage | Local disk only — not suitable for multi-instance deploy without external storage |
 
-```bash
-git checkout -b feat/your-feature
-# edit
-npm run lint
-git commit -m "feat: describe your change"
-```
+### Possible next steps
 
-Open a PR with description + screenshots or screen recording.
+- Kick participant, lock room, copy link + password
+- Toast notifications instead of alerts
+- Auto re-verify on expired session
+- PWA / installable app
+- SFU (mediasoup / LiveKit) for larger calls
+- Redis-backed room state for multi-instance deploy
+- S3/R2 recording storage
 
 ---
 
 ## License
 
-Open source — use, fork, and adapt freely. A GitHub star is appreciated if you ship something built on NexusRTC.
-
----
-
-<div align="center">
-
-<h3>
-  <b>
-    <font color="#94a3b8">Built with Next.js · React · WebRTC · Node.js</font>
-  </b>
-</h3>
-
-<br>
-
-[![Star on GitHub](https://img.shields.io/github/stars/subhm2004/NexusRTC?style=social&label=Star)](https://github.com/subhm2004/NexusRTC)
-[![Issues](https://img.shields.io/github/issues/subhm2004/NexusRTC?style=flat&label=Issues)](https://github.com/subhm2004/NexusRTC/issues)
-
-<br>
-
-[Report issues](https://github.com/subhm2004/NexusRTC/issues) · [Star on GitHub](https://github.com/subhm2004/NexusRTC)
-
-</div>
+MIT

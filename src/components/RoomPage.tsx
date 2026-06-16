@@ -4,62 +4,197 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   getStoredCreatorToken,
+  getStoredRoomPassword,
   getStoredSessionToken,
+  setStoredRoomPassword,
   setStoredSessionToken,
-  wsUrlWithToken,
 } from "@/lib/room-auth";
+import { deriveChatKey } from "@/lib/chat-crypto";
+import { initErrorReporting, reportError } from "@/lib/error-reporting";
+import { createRoomSocket, emitSignaling, type RoomSocket } from "@/lib/socket-client";
 import { Chat } from "./Chat";
 import { RoomControlsDock, type VideoLayoutMode } from "./room/RoomControlsDock";
 import { ThemeToggle } from "./ThemeToggle";
+import { LoadingSpinner } from "./ui/LoadingSpinner";
+import { PageBackground } from "./ui/PageBackground";
+import {
+  buildRecordingFilename,
+  formatRecordingElapsed,
+  formatRecordingTimestamp,
+} from "@/lib/recording-utils";
 
 const VIDEO_LAYOUT_KEY = "nexus-video-layout";
 
-function RemoteVideo({ stream }: { stream: MediaStream }) {
+/** Bind remote tracks to the browser MediaStream so replaceTrack (screen share) stays live. */
+function bindRemoteTrack(
+  peerId: string,
+  event: RTCTrackEvent,
+  setRemoteStreams: React.Dispatch<React.SetStateAction<Record<string, MediaStream>>>
+) {
+  const track = event.track;
+  if (track.readyState === "ended") return;
+
+  setRemoteStreams((prev) => {
+    const pcStream = event.streams?.[0];
+    if (pcStream) {
+      return { ...prev, [peerId]: pcStream };
+    }
+
+    let stream = prev[peerId];
+    if (!stream) stream = new MediaStream();
+
+    const sameKind = stream.getTracks().find((t) => t.kind === track.kind && t.id !== track.id);
+    if (sameKind) stream.removeTrack(sameKind);
+    if (!stream.getTracks().some((t) => t.id === track.id)) {
+      stream.addTrack(track);
+    }
+    return { ...prev, [peerId]: stream };
+  });
+}
+
+function remoteVideoTrackId(stream: MediaStream | undefined): string {
+  return stream?.getVideoTracks().find((t) => t.readyState === "live")?.id ?? "none";
+}
+
+type PeerConnectionCtx = {
+  send: (msg: {
+    to?: string;
+    event: string;
+    data?: string;
+    name?: string;
+    raised?: boolean;
+    active?: boolean;
+  }) => void;
+  setRemoteStreams: React.Dispatch<React.SetStateAction<Record<string, MediaStream>>>;
+  replaceVideoTrackOnPeer: (pc: RTCPeerConnection, track: MediaStreamTrack) => Promise<boolean>;
+  isScreenSharingRef: React.MutableRefObject<boolean>;
+  screenStreamRef: React.MutableRefObject<MediaStream | null>;
+  iceRestartTimersRef: React.MutableRefObject<Map<string, ReturnType<typeof setTimeout>>>;
+};
+
+function attachPeerConnectionHandlers(
+  peerId: string,
+  pc: RTCPeerConnection,
+  ctx: PeerConnectionCtx
+) {
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      ctx.send({ to: peerId, event: "candidate", data: JSON.stringify(e.candidate.toJSON()) });
+    }
+  };
+  pc.ontrack = (e) => bindRemoteTrack(peerId, e, ctx.setRemoteStreams);
+  pc.onconnectionstatechange = () => {
+    const state = pc.connectionState;
+    if (
+      state === "connected" &&
+      ctx.isScreenSharingRef.current &&
+      ctx.screenStreamRef.current
+    ) {
+      const screenTrack = ctx.screenStreamRef.current.getVideoTracks()[0];
+      if (screenTrack) ctx.replaceVideoTrackOnPeer(pc, screenTrack).catch(() => {});
+      return;
+    }
+    if (state === "failed" || state === "disconnected") {
+      const existing = ctx.iceRestartTimersRef.current.get(peerId);
+      if (existing) clearTimeout(existing);
+      const delay = state === "failed" ? 0 : 2500;
+      const timer = setTimeout(() => {
+        ctx.iceRestartTimersRef.current.delete(peerId);
+        if (pc.connectionState !== "failed" && pc.connectionState !== "disconnected") return;
+        if (pc.signalingState !== "stable") return;
+        pc.createOffer({ iceRestart: true })
+          .then((offer) => pc.setLocalDescription(offer))
+          .then(() =>
+            ctx.send({ to: peerId, event: "offer", data: JSON.stringify(pc.localDescription) })
+          )
+          .catch(() => {});
+      }, delay);
+      ctx.iceRestartTimersRef.current.set(peerId, timer);
+    }
+  };
+}
+
+function RemoteVideo({
+  stream,
+  isScreenShare = false,
+  onVideoTrackChange,
+}: {
+  stream: MediaStream;
+  isScreenShare?: boolean;
+  onVideoTrackChange?: () => void;
+}) {
   const ref = useRef<HTMLVideoElement>(null);
-  
+
   useEffect(() => {
     const el = ref.current;
     if (!el || !stream) return;
-    
-    // Always set srcObject when stream changes
-    el.srcObject = stream;
-    
-    // Try to play
-    const playPromise = el.play();
-    if (playPromise !== undefined) {
-      playPromise.catch((err) => {
-        console.error("Video play error:", err);
-      });
-    }
-    
-    // Handle track additions
-    const handleAddTrack = () => {
-      if (el && el.srcObject === stream) {
+
+    const attach = () => {
+      if (el.srcObject !== stream) {
+        el.srcObject = stream;
+      }
+      el.play().catch(() => {});
+    };
+
+    const hardRefresh = () => {
+      el.srcObject = null;
+      requestAnimationFrame(() => {
+        el.srcObject = stream;
         el.play().catch(() => {});
-      }
+        onVideoTrackChange?.();
+      });
     };
-    
-    // Handle track removals
-    const handleRemoveTrack = () => {
-      // If stream has no video tracks, might need to handle this
-      if (stream.getVideoTracks().length === 0 && stream.getAudioTracks().length === 0) {
-        el.srcObject = null;
-      }
+
+    attach();
+
+    const trackListeners: Array<{ track: MediaStreamTrack; fn: () => void }> = [];
+    const watchTrack = (track: MediaStreamTrack) => {
+      const onChange = () => {
+        if (track.kind === "video") hardRefresh();
+        else attach();
+      };
+      track.addEventListener("ended", onChange);
+      track.addEventListener("mute", onChange);
+      track.addEventListener("unmute", onChange);
+      trackListeners.push({ track, fn: onChange });
     };
-    
-    stream.addEventListener('addtrack', handleAddTrack);
-    stream.addEventListener('removetrack', handleRemoveTrack);
-    
+
+    stream.getTracks().forEach(watchTrack);
+
+    const onAddTrack = (ev: MediaStreamTrackEvent) => {
+      watchTrack(ev.track);
+      if (ev.track.kind === "video") hardRefresh();
+      else attach();
+    };
+
+    const onRemoveTrack = (ev: MediaStreamTrackEvent) => {
+      if (ev.track.kind === "video") hardRefresh();
+      else attach();
+    };
+
+    stream.addEventListener("addtrack", onAddTrack);
+    stream.addEventListener("removetrack", onRemoveTrack);
+
     return () => {
-      stream.removeEventListener('addtrack', handleAddTrack);
-      stream.removeEventListener('removetrack', handleRemoveTrack);
-      if (el) {
-        el.srcObject = null;
-      }
+      stream.removeEventListener("addtrack", onAddTrack);
+      stream.removeEventListener("removetrack", onRemoveTrack);
+      trackListeners.forEach(({ track, fn }) => {
+        track.removeEventListener("ended", fn);
+        track.removeEventListener("mute", fn);
+        track.removeEventListener("unmute", fn);
+      });
+      if (el) el.srcObject = null;
     };
-  }, [stream]);
-  
-  return <video ref={ref} autoPlay playsInline muted={false} />;
+  }, [stream, onVideoTrackChange]);
+
+  return (
+    <video
+      ref={ref}
+      autoPlay
+      playsInline
+      className={isScreenShare ? "video-screen-share" : undefined}
+    />
+  );
 }
 
 function CopyLinkButton({ roomLink, copy }: { roomLink: string; copy: (t: string) => void }) {
@@ -80,27 +215,29 @@ function CopyLinkButton({ roomLink, copy }: { roomLink: string; copy: (t: string
   );
 }
 
-const ICE = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-  ],
-};
+const DEFAULT_ICE: RTCIceServer[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+];
 
-function getWsBase() {
-  if (typeof window === "undefined") return "";
-  return (window.location.protocol === "https:" ? "wss:" : "ws:") + "//" + window.location.host;
-}
+const REACTION_EMOJIS = ["👍", "❤️", "😂", "👏", "🔥"] as const;
 
 const CHAT_NAME_KEY = "nexus-chat-name";
 
 const CANVAS_WIDTH = 1280;
 const CANVAS_HEIGHT = 720;
+const RECORDING_HEADER_H = 44;
+
+type RecordingMeta = {
+  roomName: string;
+  startedAt: Date;
+};
 
 type ParticipantInfo = { id: string; stream: MediaStream; label: string };
 
 async function createMeetingCompositeStream(
-  getParticipants: () => ParticipantInfo[]
+  getParticipants: () => ParticipantInfo[],
+  meta?: RecordingMeta
 ): Promise<{ stream: MediaStream; cleanup: () => void }> {
   const canvas = document.createElement("canvas");
   canvas.width = CANVAS_WIDTH;
@@ -152,17 +289,47 @@ async function createMeetingCompositeStream(
     syncParticipants(participants);
 
     const n = participants.length;
+    const stageTop = meta ? RECORDING_HEADER_H : 0;
+    const stageH = CANVAS_HEIGHT - stageTop;
+
+    ctx.fillStyle = "#0f172a";
+    ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+    if (meta) {
+      const { display } = formatRecordingTimestamp(meta.startedAt);
+      const elapsed = formatRecordingElapsed(Date.now() - meta.startedAt.getTime());
+
+      ctx.fillStyle = "rgba(15, 23, 42, 0.96)";
+      ctx.fillRect(0, 0, CANVAS_WIDTH, RECORDING_HEADER_H);
+
+      ctx.fillStyle = "#34d399";
+      ctx.font = "600 14px system-ui, sans-serif";
+      ctx.fillText("NexusRTC", 14, 28);
+
+      ctx.fillStyle = "#e2e8f0";
+      ctx.font = "500 13px system-ui, sans-serif";
+      const roomLabel =
+        meta.roomName.length > 28 ? `${meta.roomName.slice(0, 26)}…` : meta.roomName;
+      ctx.fillText(roomLabel, 108, 28);
+
+      ctx.textAlign = "right";
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "500 12px system-ui, sans-serif";
+      ctx.fillText(`Recorded · ${display}`, CANVAS_WIDTH - 14, 28);
+      ctx.textAlign = "left";
+    }
+
     if (n === 0) {
       ctx.fillStyle = "#1e293b";
-      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      ctx.fillRect(0, stageTop, CANVAS_WIDTH, stageH);
     } else {
       const cols = n <= 2 ? n : Math.ceil(Math.sqrt(n));
       const rows = Math.ceil(n / cols);
       const cellW = CANVAS_WIDTH / cols;
-      const cellH = CANVAS_HEIGHT / rows;
+      const cellH = stageH / rows;
 
       ctx.fillStyle = "#1e293b";
-      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      ctx.fillRect(0, stageTop, CANVAS_WIDTH, stageH);
 
       for (let i = 0; i < participants.length; i++) {
         const p = participants[i];
@@ -171,17 +338,37 @@ async function createMeetingCompositeStream(
         const col = i % cols;
         const row = Math.floor(i / cols);
         const x = col * cellW;
-        const y = row * cellH;
+        const y = stageTop + row * cellH;
         if (v.readyState >= 2) {
           ctx.drawImage(v, x, y, cellW, cellH);
         }
-        ctx.fillStyle = "rgba(0,0,0,0.6)";
+        ctx.fillStyle = "rgba(0,0,0,0.65)";
         ctx.fillRect(x, y + cellH - 28, cellW, 28);
         ctx.fillStyle = "#fff";
-        ctx.font = "14px system-ui";
+        ctx.font = "14px system-ui, sans-serif";
         ctx.fillText(p.label, x + 8, y + cellH - 10);
       }
     }
+
+    if (meta) {
+      const elapsed = formatRecordingElapsed(Date.now() - meta.startedAt.getTime());
+      const badgeW = 88;
+      const badgeH = 26;
+      const badgeX = CANVAS_WIDTH - badgeW - 12;
+      const badgeY = CANVAS_HEIGHT - badgeH - 12;
+      ctx.fillStyle = "rgba(0, 0, 0, 0.72)";
+      ctx.beginPath();
+      ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 6);
+      ctx.fill();
+      ctx.fillStyle = "#f87171";
+      ctx.beginPath();
+      ctx.arc(badgeX + 14, badgeY + badgeH / 2, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#fff";
+      ctx.font = "600 12px ui-monospace, monospace";
+      ctx.fillText(elapsed, badgeX + 24, badgeY + 17);
+    }
+
     animationId = requestAnimationFrame(draw);
   };
   draw();
@@ -255,6 +442,7 @@ function PasswordModal({
         return;
       }
       setStoredSessionToken(roomId, data.sessionToken);
+      setStoredRoomPassword(roomId, trimmed);
       onSuccess(data.sessionToken);
     } catch {
       setError("Could not verify password. Try again.");
@@ -387,13 +575,13 @@ function NameInputModal({
 }
 
 export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string }) {
-  const [wsBase, setWsBase] = useState("");
   const [authState, setAuthState] = useState<"loading" | "notfound" | "password" | "ready">("loading");
   const [sessionToken, setSessionToken] = useState<string | null>(null);
   const [roomDisplayName, setRoomDisplayName] = useState<string | null>(null);
   const [isHostJoin, setIsHostJoin] = useState(false);
   const [noPerm, setNoPerm] = useState(false);
-  const [connClosed, setConnClosed] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [connFailed, setConnFailed] = useState(false);
   const [viewerCount, setViewerCount] = useState("0");
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
   const [userName, setUserName] = useState<string | null>(null);
@@ -403,15 +591,29 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
   const [peerNames, setPeerNames] = useState<Record<string, string>>({});
   const [isRecording, setIsRecording] = useState(false);
   const [recordingStatus, setRecordingStatus] = useState<"idle" | "uploading" | "saved" | "error">("idle");
+  const [recordingSavedLabel, setRecordingSavedLabel] = useState<string | null>(null);
   const [recordingPeer, setRecordingPeer] = useState<{ id: string; name: string } | null>(null);
   const [videoLayout, setVideoLayout] = useState<VideoLayoutMode>("auto");
   const [raisedHands, setRaisedHands] = useState<Record<string, boolean>>({});
   const [isHandRaised, setIsHandRaised] = useState(false);
+  const [remoteScreenShare, setRemoteScreenShare] = useState<Record<string, boolean>>({});
+  const [remoteVideoEpoch, setRemoteVideoEpoch] = useState<Record<string, number>>({});
+  const [inWaitingRoom, setInWaitingRoom] = useState(false);
+  const [waitingGuests, setWaitingGuests] = useState<{ id: string; name: string }[]>([]);
+  const [waitingRoomEnabled, setWaitingRoomEnabled] = useState(true);
+  const [peerReactions, setPeerReactions] = useState<Record<string, { emoji: string; id: number }[]>>({});
+  const [chatKey, setChatKey] = useState<CryptoKey | null>(null);
+  const [roomRejected, setRoomRejected] = useState(false);
+  const [roomFull, setRoomFull] = useState(false);
+  const [myPeerId, setMyPeerId] = useState<string | null>(null);
 
+  const [roomSocket, setRoomSocket] = useState<RoomSocket | null>(null);
+  const iceServersRef = useRef<RTCIceServer[]>(DEFAULT_ICE);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
   const compositeCleanupRef = useRef<(() => void) | null>(null);
+  const recordingStartedAtRef = useRef<Date | null>(null);
   const remoteStreamsRef = useRef(remoteStreams);
   const peerNamesRef = useRef(peerNames);
   useEffect(() => {
@@ -420,13 +622,155 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
   }, [remoteStreams, peerNames]);
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
+  const isScreenSharingRef = useRef(false);
+  const screenShareRetryTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const wsRef = useRef<WebSocket | null>(null);
+  const socketRef = useRef<RoomSocket | null>(null);
   const myIdRef = useRef<string | null>(null);
   const candidateQueueRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  const iceRestartTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const leavingRoomRef = useRef(false);
+  const reactionIdRef = useRef(0);
 
   useEffect(() => {
-    setWsBase(getWsBase());
+    initErrorReporting().catch(() => {});
+    fetch("/api/ice-config")
+      .then((r) => r.json())
+      .then((data) => {
+        if (Array.isArray(data.iceServers) && data.iceServers.length) {
+          iceServersRef.current = data.iceServers;
+        }
+      })
+      .catch((err) => reportError(err, { context: "ice-config" }));
+  }, []);
+
+  useEffect(() => {
+    const password = getStoredRoomPassword(uuid);
+    if (!password) {
+      setChatKey(null);
+      return;
+    }
+    deriveChatKey(uuid, password)
+      .then(setChatKey)
+      .catch((err) => reportError(err, { context: "chat-key" }));
+  }, [uuid, sessionToken]);
+
+  useEffect(() => {
+    isScreenSharingRef.current = isScreenSharing;
+  }, [isScreenSharing]);
+
+  const getOutboundVideoTrack = useCallback((): MediaStreamTrack | null => {
+    if (isScreenSharingRef.current && screenStreamRef.current) {
+      const screenTrack = screenStreamRef.current.getVideoTracks()[0];
+      if (screenTrack && screenTrack.readyState !== "ended") return screenTrack;
+    }
+    const cameraTrack = localStreamRef.current?.getVideoTracks()[0];
+    if (cameraTrack && cameraTrack.readyState !== "ended") return cameraTrack;
+    return null;
+  }, []);
+
+  const attachLocalTracksToPeer = useCallback(
+    (pc: RTCPeerConnection) => {
+      const local = localStreamRef.current;
+      if (!local) return;
+
+      local.getAudioTracks().forEach((track) => {
+        if (!pc.getSenders().some((s) => s.track?.id === track.id)) {
+          pc.addTrack(track, local);
+        }
+      });
+
+      const videoTrack = getOutboundVideoTrack();
+      if (!videoTrack) return;
+
+      const videoStream =
+        isScreenSharingRef.current && screenStreamRef.current
+          ? screenStreamRef.current
+          : local;
+
+      if (!pc.getSenders().some((s) => s.track?.id === videoTrack.id)) {
+        pc.addTrack(videoTrack, videoStream);
+      }
+    },
+    [getOutboundVideoTrack]
+  );
+
+  const replaceVideoTrackOnPeer = useCallback(
+    async (pc: RTCPeerConnection, track: MediaStreamTrack): Promise<boolean> => {
+      if (pc.connectionState === "closed" || pc.connectionState === "failed") {
+        return false;
+      }
+
+      const videoSender =
+        pc.getSenders().find((s) => s.track?.kind === "video") ??
+        pc.getTransceivers().find((t) => t.sender.track?.kind === "video")?.sender;
+
+      if (videoSender) {
+        await videoSender.replaceTrack(track);
+        return true;
+      }
+
+      const local = localStreamRef.current;
+      const stream =
+        isScreenSharingRef.current && screenStreamRef.current
+          ? screenStreamRef.current
+          : local;
+      if (stream) {
+        pc.addTrack(track, stream);
+        return true;
+      }
+      return false;
+    },
+    []
+  );
+
+  const replaceVideoTrackOnAllPeers = useCallback(
+    async (track: MediaStreamTrack) => {
+      await Promise.all(
+        Array.from(peersRef.current.entries()).map(([peerId, pc]) =>
+          replaceVideoTrackOnPeer(pc, track).catch((err) => {
+            console.warn(`[${peerId}] replaceTrack failed:`, err);
+            return false;
+          })
+        )
+      );
+    },
+    [replaceVideoTrackOnPeer]
+  );
+
+  const clearScreenShareRetries = useCallback(() => {
+    screenShareRetryTimersRef.current.forEach(clearTimeout);
+    screenShareRetryTimersRef.current = [];
+  }, []);
+
+  const scheduleScreenShareRetries = useCallback(
+    (track: MediaStreamTrack) => {
+      clearScreenShareRetries();
+      [300, 1000, 2500].forEach((ms) => {
+        const timer = setTimeout(() => {
+          if (
+            isScreenSharingRef.current &&
+            screenStreamRef.current?.getVideoTracks()[0]?.id === track.id
+          ) {
+            replaceVideoTrackOnAllPeers(track);
+          }
+        }, ms);
+        screenShareRetryTimersRef.current.push(timer);
+      });
+    },
+    [clearScreenShareRetries, replaceVideoTrackOnAllPeers]
+  );
+
+  const updateLocalPreview = useCallback(() => {
+    const el = localVideoRef.current;
+    if (!el) return;
+    if (isScreenSharingRef.current && screenStreamRef.current) {
+      el.srcObject = screenStreamRef.current;
+      return;
+    }
+    if (localStreamRef.current) {
+      el.srcObject = localStreamRef.current;
+    }
   }, []);
 
   useEffect(() => {
@@ -444,15 +788,42 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
     }
   }, []);
 
-  const roomWsUrl = wsBase
-    ? wsUrlWithToken(`${wsBase}/room/${uuid}/websocket`, sessionToken)
-    : "";
-  const chatWsUrl = wsBase
-    ? wsUrlWithToken(`${wsBase}/room/${uuid}/chat/websocket`, sessionToken)
-    : "";
-  const viewerWsUrl = wsBase
-    ? wsUrlWithToken(`${wsBase}/room/${uuid}/viewer/websocket`, sessionToken)
-    : "";
+  const bumpRemoteVideo = useCallback((peerId: string) => {
+    setRemoteVideoEpoch((prev) => ({ ...prev, [peerId]: (prev[peerId] ?? 0) + 1 }));
+  }, []);
+
+  const send = useCallback(
+    (msg: {
+      to?: string;
+      event: string;
+      data?: string;
+      name?: string;
+      raised?: boolean;
+      active?: boolean;
+      guestId?: string;
+      emoji?: string;
+      enabled?: boolean;
+    }) => {
+      emitSignaling(socketRef.current, msg);
+    },
+    []
+  );
+
+  const renegotiateAllPeers = useCallback(async () => {
+    await Promise.all(
+      Array.from(peersRef.current.entries()).map(async ([peerId, pc]) => {
+        if (pc.connectionState === "closed" || pc.connectionState === "failed") return;
+        if (pc.signalingState !== "stable") return;
+        try {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          send({ to: peerId, event: "offer", data: JSON.stringify(pc.localDescription) });
+        } catch (err) {
+          console.warn(`[${peerId}] renegotiate failed:`, err);
+        }
+      })
+    );
+  }, [send]);
 
   useEffect(() => {
     let cancelled = false;
@@ -516,13 +887,6 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
     navigator.clipboard?.writeText(text).then(() => {});
   };
 
-  const send = useCallback(
-    (msg: { to?: string; event: string; data?: string; name?: string; raised?: boolean }) => {
-      if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify(msg));
-    },
-    []
-  );
-
   const flushCandidates = useCallback((peerId: string, pc: RTCPeerConnection) => {
     const q = candidateQueueRef.current.get(peerId);
     if (!q?.length) return;
@@ -530,200 +894,280 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
     candidateQueueRef.current.delete(peerId);
   }, []);
 
+  const peerConnectionCtx = useMemo<PeerConnectionCtx>(
+    () => ({
+      send,
+      setRemoteStreams,
+      replaceVideoTrackOnPeer,
+      isScreenSharingRef,
+      screenStreamRef,
+      iceRestartTimersRef,
+    }),
+    [send, replaceVideoTrackOnPeer]
+  );
+
   const createOfferTo = useCallback(
-    (peerId: string, stream: MediaStream) => {
+    (peerId: string, _stream?: MediaStream) => {
       if (peersRef.current.has(peerId)) return;
       const myId = myIdRef.current;
       if (!myId || myId >= peerId) return;
-      const pc = new RTCPeerConnection(ICE);
+      const pc = new RTCPeerConnection({ iceServers: iceServersRef.current });
       peersRef.current.set(peerId, pc);
-      
-      // Use screen stream if sharing, otherwise use camera stream
-      const streamToUse = isScreenSharing && screenStreamRef.current 
-        ? screenStreamRef.current 
-        : stream;
-      
-      streamToUse.getTracks().forEach((t) => pc.addTrack(t, streamToUse));
-      pc.onicecandidate = (e) => {
-        if (e.candidate) send({ to: peerId, event: "candidate", data: JSON.stringify(e.candidate.toJSON()) });
-      };
-      pc.ontrack = (e) => {
-        console.log(`[${peerId}] Track received (offerer):`, e.track.kind, e.track.id, e.track.readyState, 'readyState:', e.track.readyState);
-        const track = e.track;
-        if (track.readyState === 'ended') {
-          console.log(`[${peerId}] Track ended, ignoring`);
-          return;
-        }
-        setRemoteStreams((prev) => {
-          const ex = prev[peerId];
-          if (ex) {
-            // Check if track already exists
-            if (ex.getTracks().some(t => t.id === track.id)) {
-              console.log(`[${peerId}] Track ${track.id} already in stream`);
-              return prev;
-            }
-            // Create new stream with all tracks including the new one
-            const allTracks = [...ex.getTracks(), track];
-            const newStream = new MediaStream(allTracks);
-            console.log(`[${peerId}] Updated stream (offerer): ${allTracks.length} tracks`);
-            return { ...prev, [peerId]: newStream };
-          }
-          // Create new stream for this peer
-          const s = e.streams?.[0] || new MediaStream([track]);
-          console.log(`[${peerId}] Created new stream (offerer) with ${s.getTracks().length} tracks`);
-          return { ...prev, [peerId]: s };
-        });
-      };
-      pc.onconnectionstatechange = () => {
-        const state = pc.connectionState;
-        console.log(`[${peerId}] Connection state:`, state);
-        if (state === 'failed' || state === 'disconnected') {
-          // Try to reconnect or clean up
-          console.warn(`[${peerId}] Connection ${state}, may need to reconnect`);
-        }
-      };
+
+      attachLocalTracksToPeer(pc);
+      attachPeerConnectionHandlers(peerId, pc, peerConnectionCtx);
+
       pc.createOffer()
         .then((offer) => pc.setLocalDescription(offer))
         .then(() => send({ to: peerId, event: "offer", data: JSON.stringify(pc.localDescription) }))
         .catch((err) => console.error(`[${peerId}] Offer error:`, err));
     },
-    [send, isScreenSharing]
+    [send, attachLocalTracksToPeer, peerConnectionCtx]
   );
 
-  const connectRoomWs = useCallback(() => {
-    if (!roomWsUrl || !localStreamRef.current || !userName) return;
-    if (wsRef.current?.readyState === 1) return;
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-    const ws = new WebSocket(roomWsUrl);
-    wsRef.current = ws;
-    setConnClosed(false);
+  const showPeerReaction = useCallback((peerId: string, emoji: string) => {
+    const id = ++reactionIdRef.current;
+    setPeerReactions((prev) => ({
+      ...prev,
+      [peerId]: [...(prev[peerId] || []), { emoji, id }],
+    }));
+    setTimeout(() => {
+      setPeerReactions((prev) => ({
+        ...prev,
+        [peerId]: (prev[peerId] || []).filter((r) => r.id !== id),
+      }));
+    }, 3000);
+  }, []);
 
-    ws.onopen = () => {
-      // Send our name IMMEDIATELY when WebSocket opens (before any other messages)
-      // This ensures the server has our name before other peers see us
-      // Send name immediately (this should be the first message)
-      if (userName) {
-        ws.send(JSON.stringify({ event: "set-name", name: userName }));
-      }
-    };
+  const sendReaction = useCallback(
+    (emoji: string) => {
+      const myId = myIdRef.current;
+      send({ event: "reaction", emoji });
+      if (myId) showPeerReaction(myId, emoji);
+    },
+    [send, showPeerReaction]
+  );
 
-    ws.onclose = () => {
-      setConnClosed(true);
-      wsRef.current = null;
+  const admitGuest = useCallback(
+    (guestId: string) => {
+      send({ event: "admit-guest", guestId });
+      setWaitingGuests((prev) => prev.filter((g) => g.id !== guestId));
+    },
+    [send]
+  );
+
+  const rejectGuest = useCallback(
+    (guestId: string) => {
+      send({ event: "reject-guest", guestId });
+      setWaitingGuests((prev) => prev.filter((g) => g.id !== guestId));
+    },
+    [send]
+  );
+
+  const admitAllGuests = useCallback(() => {
+    send({ event: "admit-all-guests" });
+    setWaitingGuests([]);
+  }, [send]);
+
+  const toggleWaitingRoom = useCallback(() => {
+    const next = !waitingRoomEnabled;
+    setWaitingRoomEnabled(next);
+    send({ event: "waiting-room-toggle", enabled: next });
+    if (!next) setWaitingGuests([]);
+  }, [send, waitingRoomEnabled]);
+
+  const applyJoinedState = useCallback(
+    (msg: Record<string, unknown>) => {
       peersRef.current.forEach((pc) => pc.close());
       peersRef.current.clear();
+      candidateQueueRef.current.clear();
+      iceRestartTimersRef.current.forEach((t) => clearTimeout(t));
+      iceRestartTimersRef.current.clear();
       setRemoteStreams({});
-      setTimeout(connectRoomWs, 1000);
-    };
+      setReconnecting(false);
+      setConnFailed(false);
+      setInWaitingRoom(false);
 
-    ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data as string);
-      const stream = localStreamRef.current!;
-      // Use screen stream if sharing, otherwise use camera stream
-      const activeStream = isScreenSharing && screenStreamRef.current 
-        ? screenStreamRef.current 
-        : stream;
-
-        if (msg.event === "joined") {
-        myIdRef.current = msg.peerId;
-        // Store peer names from the joined message
-        if (msg.peers && Array.isArray(msg.peers)) {
-          const names: Record<string, string> = {};
-          const hands: Record<string, boolean> = {};
-          msg.peers.forEach((p: { id: string; name?: string; handRaised?: boolean } | string) => {
-            if (typeof p === 'object' && p.id) {
+      myIdRef.current = msg.peerId as string;
+      setMyPeerId(msg.peerId as string);
+      if (msg.peers && Array.isArray(msg.peers)) {
+        const names: Record<string, string> = {};
+        const hands: Record<string, boolean> = {};
+        const screenShare: Record<string, boolean> = {};
+        msg.peers.forEach(
+          (p: { id: string; name?: string; handRaised?: boolean; screenSharing?: boolean } | string) => {
+            if (typeof p === "object" && p.id) {
               names[p.id] = p.name || `Peer ${p.id.slice(0, 4)}`;
               if (p.handRaised) hands[p.id] = true;
-              createOfferTo(p.id, activeStream);
-            } else if (typeof p === 'string') {
-              createOfferTo(p, activeStream);
+              if (p.screenSharing) screenShare[p.id] = true;
+              createOfferTo(p.id);
+            } else if (typeof p === "string") {
+              createOfferTo(p);
             }
-          });
-          setPeerNames(names);
-          setRaisedHands((prev) => ({ ...prev, ...hands }));
-        } else {
-          // Backward compatibility
-          (msg.peers || []).forEach((p: string) => createOfferTo(p, activeStream));
-        }
-        // Name should already be sent in onopen, but send again to be sure
-        if (userName && ws.readyState === 1) {
-          ws.send(JSON.stringify({ event: "set-name", name: userName }));
-        }
-        // Show who is recording if someone started before we joined
-        if (msg.recordingPeer && msg.recordingPeer.peerId && msg.recordingPeer.name) {
-          setRecordingPeer({
-            id: msg.recordingPeer.peerId,
-            name: msg.recordingPeer.name,
-          });
-        }
+          }
+        );
+        setPeerNames(names);
+        setRaisedHands(hands);
+        setRemoteScreenShare(screenShare);
+      } else {
+        setPeerNames({});
+        setRaisedHands({});
+        setRemoteScreenShare({});
+        ((msg.peers as string[]) || []).forEach((p: string) => createOfferTo(p));
+      }
+      if (userName && socketRef.current?.connected) {
+        emitSignaling(socketRef.current, { event: "set-name", name: userName });
+      }
+      const rec = msg.recordingPeer as { peerId?: string; name?: string } | null;
+      if (rec?.peerId && rec?.name) {
+        setRecordingPeer({ id: rec.peerId, name: rec.name });
+      } else {
+        setRecordingPeer(null);
+      }
+      if (typeof msg.waitingRoomEnabled === "boolean") {
+        setWaitingRoomEnabled(msg.waitingRoomEnabled);
+      }
+    },
+    [createOfferTo, userName]
+  );
+
+  const handleSignalingMessage = useCallback(
+    (msg: Record<string, unknown>) => {
+      if (msg.event === "waiting-room") {
+        setInWaitingRoom(true);
+        myIdRef.current = msg.peerId as string;
+      setMyPeerId(msg.peerId as string);
+        return;
+      }
+      if (msg.event === "admitted") {
+        applyJoinedState(msg);
+        return;
+      }
+      if (msg.event === "rejected") {
+        setRoomRejected(true);
+        setInWaitingRoom(false);
+        return;
+      }
+      if (msg.event === "room-full") {
+        setRoomFull(true);
+        setInWaitingRoom(false);
+        return;
+      }
+      if (msg.event === "waiting-peer" && isHostJoin) {
+        const pid = msg.peerId as string;
+        const name = typeof msg.name === "string" && msg.name.trim()
+          ? msg.name.trim()
+          : `Guest ${pid.slice(0, 4)}`;
+        setWaitingGuests((prev) => {
+          if (prev.some((g) => g.id === pid)) return prev;
+          return [...prev, { id: pid, name }];
+        });
+        return;
+      }
+      if (msg.event === "waiting-peer-updated" && isHostJoin) {
+        const pid = msg.peerId as string;
+        const name = String(msg.name || "").trim();
+        if (!name) return;
+        setWaitingGuests((prev) =>
+          prev.map((g) => (g.id === pid ? { ...g, name } : g))
+        );
+        return;
+      }
+      if (msg.event === "waiting-peer-left" && isHostJoin) {
+        setWaitingGuests((prev) => prev.filter((g) => g.id !== msg.peerId));
+        return;
+      }
+      if (msg.event === "waiting-room-updated" && typeof msg.enabled === "boolean") {
+        setWaitingRoomEnabled(msg.enabled);
+        if (!msg.enabled) setWaitingGuests([]);
+        return;
+      }
+      if (msg.event === "reaction" && msg.peerId && msg.emoji) {
+        showPeerReaction(msg.peerId as string, String(msg.emoji));
+        return;
+      }
+      if (msg.event === "joined") {
+        applyJoinedState(msg);
         return;
       }
       if (msg.event === "new-peer") {
-        createOfferTo(msg.peerId, activeStream);
-        // Store the peer's name (use provided name or wait for update)
+        createOfferTo(msg.peerId as string);
         setPeerNames((prev) => {
           const newNames = { ...prev };
-          if (msg.name && msg.name.trim()) {
-            newNames[msg.peerId] = msg.name.trim();
+          const pid = msg.peerId as string;
+          if (typeof msg.name === "string" && msg.name.trim()) {
+            newNames[pid] = msg.name.trim();
           } else {
-            // Don't set default name yet - wait for peer-name-updated
-            newNames[msg.peerId] = `Peer ${msg.peerId.slice(0, 4)}`;
+            newNames[pid] = `Peer ${pid.slice(0, 4)}`;
           }
           return newNames;
         });
         return;
       }
-      if (msg.event === "peer-name-updated") {
-        // Update peer name when it changes (this is the authoritative source)
-        if (msg.peerId && msg.name && typeof msg.name === 'string') {
-          const trimmedName = msg.name.trim();
-          if (trimmedName) {
-            setPeerNames((prev) => ({ ...prev, [msg.peerId]: trimmedName }));
-            console.log(`[Name Update] Peer ${msg.peerId} name updated to: ${trimmedName}`);
-          }
+      if (msg.event === "peer-name-updated" && msg.peerId && msg.name) {
+        const trimmedName = String(msg.name).trim();
+        if (trimmedName) {
+          setPeerNames((prev) => ({ ...prev, [msg.peerId as string]: trimmedName }));
         }
         return;
       }
       if (msg.event === "peer-left") {
-        const pc = peersRef.current.get(msg.peerId);
+        const peerId = msg.peerId as string;
+        const iceTimer = iceRestartTimersRef.current.get(peerId);
+        if (iceTimer) {
+          clearTimeout(iceTimer);
+          iceRestartTimersRef.current.delete(peerId);
+        }
+        const pc = peersRef.current.get(peerId);
         if (pc) {
           pc.close();
-          peersRef.current.delete(msg.peerId);
+          peersRef.current.delete(peerId);
         }
         setRemoteStreams((prev) => {
           const n = { ...prev };
-          delete n[msg.peerId];
+          delete n[peerId];
           return n;
         });
         setPeerNames((prev) => {
           const n = { ...prev };
-          delete n[msg.peerId];
+          delete n[peerId];
           return n;
         });
         setRaisedHands((prev) => {
           const n = { ...prev };
-          delete n[msg.peerId];
+          delete n[peerId];
           return n;
         });
-        setRecordingPeer((prev) => (prev?.id === msg.peerId ? null : prev));
+        setRemoteScreenShare((prev) => {
+          const n = { ...prev };
+          delete n[peerId];
+          return n;
+        });
+        setRecordingPeer((prev) => (prev?.id === peerId ? null : prev));
         return;
       }
       if (msg.event === "hand-raised" && msg.peerId) {
         setRaisedHands((prev) => {
           const next = { ...prev };
-          if (msg.raised) next[msg.peerId] = true;
-          else delete next[msg.peerId];
+          if (msg.raised) next[msg.peerId as string] = true;
+          else delete next[msg.peerId as string];
+          return next;
+        });
+        return;
+      }
+      if (msg.event === "screen-share" && msg.peerId) {
+        setRemoteScreenShare((prev) => {
+          const next = { ...prev };
+          if (msg.active) next[msg.peerId as string] = true;
+          else delete next[msg.peerId as string];
           return next;
         });
         return;
       }
       if (msg.event === "recording-started") {
         setRecordingPeer({
-          id: msg.peerId,
-          name: msg.name || `Peer ${msg.peerId?.slice(0, 4) || "?"}`,
+          id: msg.peerId as string,
+          name: (msg.name as string) || `Peer ${String(msg.peerId).slice(0, 4)}`,
         });
         return;
       }
@@ -732,140 +1176,144 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
         return;
       }
       if (msg.event === "offer") {
-        const from = msg.from;
+        const from = msg.from as string;
         let pc: RTCPeerConnection | undefined = peersRef.current.get(from);
         if (!pc) {
-          pc = new RTCPeerConnection(ICE);
+          pc = new RTCPeerConnection({ iceServers: iceServersRef.current });
           peersRef.current.set(from, pc);
-          
-          // Add local tracks to the connection (use screen stream if sharing)
-          const streamToUse = isScreenSharing && screenStreamRef.current 
-            ? screenStreamRef.current 
-            : activeStream;
-          streamToUse.getTracks().forEach((t) => pc!.addTrack(t, streamToUse));
-          
-          pc!.onicecandidate = (e) => {
-            if (e.candidate) send({ to: from, event: "candidate", data: JSON.stringify(e.candidate.toJSON()) });
-          };
-          pc!.ontrack = (e) => {
-            const track = e.track;
-            console.log(`[${from}] Track received (answerer):`, track.kind, track.id, track.readyState);
-            if (track.readyState === 'ended') {
-              console.log(`[${from}] Track ended, ignoring`);
-              return;
-            }
-            setRemoteStreams((prev) => {
-              const ex = prev[from];
-              if (ex) {
-                // Check if track already exists by ID
-                if (ex.getTracks().some(t => t.id === track.id)) {
-                  console.log(`[${from}] Track ${track.id} already in stream`);
-                  return prev;
-                }
-                // Create new stream with all tracks including the new one
-                const allTracks = [...ex.getTracks(), track];
-                const newStream = new MediaStream(allTracks);
-                console.log(`[${from}] Updated stream (answerer): ${allTracks.length} tracks`);
-                return { ...prev, [from]: newStream };
-              }
-              // Create new stream for this peer
-              const s = e.streams?.[0] || new MediaStream([track]);
-              console.log(`[${from}] Created new stream (answerer) with ${s.getTracks().length} tracks`);
-              return { ...prev, [from]: s };
-            });
-          };
-          const pcForStateChange = pc;
-          pcForStateChange.onconnectionstatechange = () => {
-            const state = pcForStateChange.connectionState;
-            console.log(`[${from}] Connection state (answerer):`, state);
-            if (state === 'failed' || state === 'disconnected') {
-              console.warn(`[${from}] Connection ${state} (answerer), may need to reconnect`);
-            }
-          };
+          attachLocalTracksToPeer(pc);
+          attachPeerConnectionHandlers(from, pc, peerConnectionCtx);
         }
-        const offer = JSON.parse(msg.data);
+        const offer = JSON.parse(msg.data as string);
         if (!pc) return;
-        pc.setRemoteDescription(new RTCSessionDescription(offer))
-          .then(() => pc.createAnswer())
-          .then((a) => pc.setLocalDescription(a))
-          .then(() => send({ to: from, event: "answer", data: JSON.stringify(pc.localDescription) }))
-          .then(() => flushCandidates(from, pc))
-          .catch((err) => console.error(`[${from}] Answer error:`, err));
+        const applyOffer = async () => {
+          if (pc!.signalingState === "have-local-offer") {
+            await pc!.setLocalDescription({ type: "rollback" } as RTCSessionDescriptionInit);
+          }
+          await pc!.setRemoteDescription(new RTCSessionDescription(offer));
+          const answer = await pc!.createAnswer();
+          await pc!.setLocalDescription(answer);
+          send({ to: from, event: "answer", data: JSON.stringify(pc!.localDescription) });
+          flushCandidates(from, pc!);
+        };
+        applyOffer().catch(() => {});
         return;
       }
       if (msg.event === "answer") {
-        const pc = peersRef.current.get(msg.from);
+        const pc = peersRef.current.get(msg.from as string);
         if (!pc) return;
-        pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(msg.data))).then(() => flushCandidates(msg.from, pc)).catch(() => {});
+        pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(msg.data as string)))
+          .then(() => flushCandidates(msg.from as string, pc))
+          .catch(() => {});
         return;
       }
       if (msg.event === "candidate") {
-        const from = msg.from;
+        const from = msg.from as string;
         const pc = peersRef.current.get(from);
-        const c = JSON.parse(msg.data);
+        const c = JSON.parse(msg.data as string);
         if (pc && (pc.remoteDescription || pc.localDescription)) {
-          pc.addIceCandidate(new RTCIceCandidate(c)).then(() => flushCandidates(from, pc)).catch(() => {});
+          pc.addIceCandidate(new RTCIceCandidate(c))
+            .then(() => flushCandidates(from, pc))
+            .catch(() => {});
         } else {
           if (!candidateQueueRef.current.has(from)) candidateQueueRef.current.set(from, []);
           candidateQueueRef.current.get(from)!.push(c);
         }
       }
-    };
-  }, [roomWsUrl, createOfferTo, send, flushCandidates, userName, isScreenSharing]);
+    },
+    [createOfferTo, send, flushCandidates, userName, attachLocalTracksToPeer, peerConnectionCtx, applyJoinedState, showPeerReaction, isHostJoin]
+  );
 
-  // Send name update when userName changes and WebSocket is connected
+  const resetPeerConnections = useCallback(() => {
+    peersRef.current.forEach((pc) => pc.close());
+    peersRef.current.clear();
+    candidateQueueRef.current.clear();
+    iceRestartTimersRef.current.forEach((t) => clearTimeout(t));
+    iceRestartTimersRef.current.clear();
+    setRemoteStreams({});
+  }, []);
+
+  const connectRoomSocket = useCallback(() => {
+    if (!sessionToken || !localStreamRef.current || !userName) return;
+    if (socketRef.current?.connected) return;
+
+    if (socketRef.current) {
+      socketRef.current.removeAllListeners();
+      socketRef.current.disconnect();
+      socketRef.current = null;
+    }
+
+    leavingRoomRef.current = false;
+    const socket = createRoomSocket(uuid, sessionToken);
+    socketRef.current = socket;
+    setReconnecting(false);
+    setConnFailed(false);
+
+    socket.on("connect", () => {
+      if (leavingRoomRef.current) return;
+      setReconnecting(false);
+      setConnFailed(false);
+      setRoomSocket(socket);
+      if (userName) emitSignaling(socket, { event: "set-name", name: userName });
+    });
+
+    socket.on("disconnect", () => {
+      if (leavingRoomRef.current) return;
+      setRoomSocket(null);
+      setReconnecting(true);
+      resetPeerConnections();
+    });
+
+    socket.io.on("reconnect_failed", () => {
+      if (leavingRoomRef.current) return;
+      setReconnecting(false);
+      setConnFailed(true);
+    });
+
+    socket.on("signaling", handleSignalingMessage);
+    socket.on("viewer:count", (count: number) => setViewerCount(String(count)));
+  }, [uuid, sessionToken, userName, handleSignalingMessage, resetPeerConnections]);
+
   useEffect(() => {
-    if (userName && wsRef.current?.readyState === 1) {
-      wsRef.current.send(JSON.stringify({ event: "set-name", name: userName }));
+    if (userName && socketRef.current?.connected) {
+      emitSignaling(socketRef.current, { event: "set-name", name: userName });
     }
   }, [userName]);
 
-  // viewer count ws
-  const viewerWsRef = useRef<WebSocket | null>(null);
   useEffect(() => {
-    if (!viewerWsUrl) return;
-    let t: ReturnType<typeof setTimeout>;
-    const connect = () => {
-      const ws = new WebSocket(viewerWsUrl);
-      viewerWsRef.current = ws;
-      ws.onmessage = (e) => setViewerCount(String(e.data));
-      ws.onclose = () => {
-        viewerWsRef.current = null;
-        setViewerCount("0");
-        t = setTimeout(connect, 1000);
-      };
-    };
-    connect();
-    return () => {
-      clearTimeout(t);
-      viewerWsRef.current?.close();
-    };
-  }, [viewerWsUrl]);
-
-  // getUserMedia + connect (only when userName is set)
-  useEffect(() => {
-    if (!roomWsUrl || !userName) return;
+    if (!sessionToken || !userName) return;
     navigator.mediaDevices
-      .getUserMedia({ video: { width: { max: 1280 }, height: { max: 720 }, frameRate: 30 }, audio: { echoCancellation: true } })
+      .getUserMedia({
+        video: { width: { max: 1280 }, height: { max: 720 }, frameRate: 30 },
+        audio: { echoCancellation: true },
+      })
       .then((stream) => {
         setNoPerm(false);
         localStreamRef.current = stream;
         if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-        // Initialize mute/video state based on tracks
         const audioTracks = stream.getAudioTracks();
         const videoTracks = stream.getVideoTracks();
         setIsMuted(audioTracks.length > 0 && !audioTracks[0].enabled);
         setIsVideoEnabled(videoTracks.length > 0 && videoTracks[0].enabled);
-        connectRoomWs();
+        connectRoomSocket();
       })
       .catch(() => setNoPerm(true));
     return () => {
+      leavingRoomRef.current = true;
+      clearScreenShareRetries();
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
-      wsRef.current?.close();
+      screenStreamRef.current = null;
+      isScreenSharingRef.current = false;
+      iceRestartTimersRef.current.forEach((t) => clearTimeout(t));
+      iceRestartTimersRef.current.clear();
+      socketRef.current?.removeAllListeners();
+      socketRef.current?.disconnect();
+      socketRef.current = null;
+      setRoomSocket(null);
       peersRef.current.forEach((pc) => pc.close());
     };
-  }, [roomWsUrl, connectRoomWs, userName]);
+  }, [sessionToken, connectRoomSocket, userName, clearScreenShareRetries]);
 
   const remoteCount = Object.keys(remoteStreams).length;
   const hasPeers = remoteCount > 0;
@@ -940,8 +1388,9 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
     });
   }, [isMuted]);
 
-  // Toggle video on/off
+  // Toggle video on/off (disabled while screen sharing — screen track is separate)
   const toggleVideo = useCallback(() => {
+    if (isScreenSharingRef.current) return;
     if (!localStreamRef.current) return;
     const videoTracks = localStreamRef.current.getVideoTracks();
     const newVideoEnabled = !isVideoEnabled;
@@ -949,203 +1398,90 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
       track.enabled = newVideoEnabled;
     });
     setIsVideoEnabled(newVideoEnabled);
-    
-    // Update all peer connections
+
     peersRef.current.forEach((pc) => {
-      const senders = pc.getSenders();
-      senders.forEach((sender) => {
-        if (sender.track && sender.track.kind === 'video') {
+      pc.getSenders().forEach((sender) => {
+        if (sender.track?.kind === "video") {
           sender.track.enabled = newVideoEnabled;
         }
       });
     });
   }, [isVideoEnabled]);
 
-  // Replace video track in all peer connections
-  const replaceVideoTrack = useCallback((newTrack: MediaStreamTrack | null) => {
-    if (!newTrack) {
-      console.warn('replaceVideoTrack called with null track');
-      return;
-    }
-    
-    console.log('Replacing video track in', peersRef.current.size, 'peer connections');
-    console.log('New track ID:', newTrack.id, 'Kind:', newTrack.kind, 'Enabled:', newTrack.enabled);
-    
-    let replacedCount = 0;
-    let failedCount = 0;
-    
-    peersRef.current.forEach((pc, peerId) => {
-      // Only replace if connection is established
-      const state = pc.connectionState;
-      if (state === 'closed' || state === 'failed') {
-        console.log(`[${peerId}] Skipping track replacement - connection state:`, state);
-        return;
-      }
-      
-      // Prefer "connected" state, but also allow "connecting" and "new"
-      if (state !== 'connected' && state !== 'connecting' && state !== 'new') {
-        console.log(`[${peerId}] Connection not ready for track replacement - state:`, state);
-        // Don't return - still try to replace as it might work
-      }
-      
-      console.log(`[${peerId}] Connection state:`, state);
-      
-      const senders = pc.getSenders();
-      console.log(`[${peerId}] Total senders:`, senders.length);
-      
-      let videoSender = senders.find((s) => s.track && s.track.kind === 'video');
-      
-      if (videoSender) {
-        // Replace existing video track
-        const oldTrack = videoSender.track;
-        console.log(`[${peerId}] Replacing existing video track. Old track ID:`, oldTrack?.id);
-        
-        videoSender.replaceTrack(newTrack).then(() => {
-          replacedCount++;
-          console.log(`[${peerId}] ✅ Video track replaced successfully. New track ID:`, newTrack.id);
-        }).catch((err) => {
-          failedCount++;
-          console.error(`[${peerId}] ❌ Error replacing track:`, err);
-        });
-      } else {
-        // No video sender exists - this shouldn't happen if connection was established properly
-        console.warn(`[${peerId}] ⚠️ No video sender found! Connection might not be fully established.`);
-        console.log(`[${peerId}] Available senders:`, senders.map(s => ({ kind: s.track?.kind, id: s.track?.id })));
-        
-        // Try to add the track anyway
-        const stream = isScreenSharing && screenStreamRef.current 
-          ? screenStreamRef.current 
-          : localStreamRef.current;
-        if (stream) {
-          try {
-            const sender = pc.addTrack(newTrack, stream);
-            console.log(`[${peerId}] Track added as new sender. Sender:`, sender);
-          } catch (err: any) {
-            console.error(`[${peerId}] Error adding track:`, err);
-          }
-        } else {
-          console.warn(`[${peerId}] No stream available to add track to`);
-        }
-      }
-    });
-    
-    console.log(`Track replacement summary: ${replacedCount} succeeded, ${failedCount} failed`);
-  }, [isScreenSharing]);
+  const stopScreenShare = useCallback(async () => {
+    if (!isScreenSharingRef.current && !screenStreamRef.current) return;
 
-  // Start screen sharing
+    clearScreenShareRetries();
+    screenStreamRef.current?.getTracks().forEach((track) => track.stop());
+    screenStreamRef.current = null;
+    isScreenSharingRef.current = false;
+    setIsScreenSharing(false);
+    send({ event: "screen-share", active: false });
+
+    const cameraTrack = localStreamRef.current?.getVideoTracks()[0];
+    if (cameraTrack) {
+      cameraTrack.enabled = isVideoEnabled;
+      await replaceVideoTrackOnAllPeers(cameraTrack);
+      await renegotiateAllPeers();
+    }
+    updateLocalPreview();
+  }, [
+    clearScreenShareRetries,
+    isVideoEnabled,
+    replaceVideoTrackOnAllPeers,
+    renegotiateAllPeers,
+    send,
+    updateLocalPreview,
+  ]);
+
   const startScreenShare = useCallback(async () => {
+    if (isScreenSharingRef.current) return;
+
     try {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { width: { max: 1920 }, height: { max: 1080 }, frameRate: 30 },
-        audio: false, // Screen share typically doesn't include audio
+        video: {
+          width: { ideal: 1920, max: 1920 },
+          height: { ideal: 1080, max: 1080 },
+          frameRate: { ideal: 30, max: 30 },
+        },
+        audio: false,
       });
-      
-      screenStreamRef.current = screenStream;
-      setIsScreenSharing(true);
-      
-      // Get the video track from screen stream
+
       const screenVideoTrack = screenStream.getVideoTracks()[0];
-      
       if (!screenVideoTrack) {
-        console.error('No video track in screen stream');
+        screenStream.getTracks().forEach((t) => t.stop());
         return;
       }
-      
-      console.log('Starting screen share, replacing tracks in', peersRef.current.size, 'peer connections');
-      console.log('Screen video track:', {
-        id: screenVideoTrack.id,
-        kind: screenVideoTrack.kind,
-        enabled: screenVideoTrack.enabled,
-        readyState: screenVideoTrack.readyState,
-        label: screenVideoTrack.label
-      });
-      
-      // Replace video track immediately
-      replaceVideoTrack(screenVideoTrack);
-      
-      // Set up connection state listeners to replace track when connections become ready
-      peersRef.current.forEach((pc, peerId) => {
-        const handleConnectionStateChange = () => {
-          const state = pc.connectionState;
-          if (state === 'connected' && isScreenSharing && screenStreamRef.current) {
-            console.log(`[${peerId}] Connection became connected, replacing track`);
-            const senders = pc.getSenders();
-            const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
-            if (videoSender) {
-              videoSender.replaceTrack(screenVideoTrack).then(() => {
-                console.log(`[${peerId}] Track replaced after connection established`);
-              }).catch((err) => {
-                console.error(`[${peerId}] Error replacing track after connection:`, err);
-              });
-            }
-          }
-        };
-        
-        // Add listener if not already connected
-        if (pc.connectionState !== 'connected') {
-          pc.addEventListener('connectionstatechange', handleConnectionStateChange);
-          // Remove listener after connection is established or after timeout
-          setTimeout(() => {
-            pc.removeEventListener('connectionstatechange', handleConnectionStateChange);
-          }, 10000);
-        }
-      });
-      
-      // Retry after delays for connections that might not have been ready
-      setTimeout(() => {
-        console.log('Retrying track replacement after 500ms...');
-        replaceVideoTrack(screenVideoTrack);
-      }, 500);
-      
-      setTimeout(() => {
-        console.log('Retrying track replacement after 2000ms...');
-        replaceVideoTrack(screenVideoTrack);
-      }, 2000);
-      
-      // Update local video display
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = screenStream;
-      }
-      
-      // Handle screen share end (user clicks stop sharing in browser UI)
+
+      screenVideoTrack.contentHint = "detail";
+      screenStreamRef.current = screenStream;
+      isScreenSharingRef.current = true;
+      setIsScreenSharing(true);
+
+      send({ event: "screen-share", active: true });
+
+      await replaceVideoTrackOnAllPeers(screenVideoTrack);
+      await renegotiateAllPeers();
+      scheduleScreenShareRetries(screenVideoTrack);
+      updateLocalPreview();
+
       screenVideoTrack.onended = () => {
         stopScreenShare();
       };
-      
     } catch (err) {
-      console.error('Error starting screen share:', err);
-      alert('Failed to start screen sharing. Please check your browser permissions.');
+      const name = (err as DOMException)?.name;
+      if (name === "NotAllowedError" || name === "AbortError") return;
+      console.error("Screen share error:", err);
+      alert("Screen sharing failed. Allow permission and try again.");
     }
-  }, [replaceVideoTrack]);
-
-  // Stop screen sharing
-  const stopScreenShare = useCallback(() => {
-    console.log('Stopping screen share');
-    
-    if (screenStreamRef.current) {
-      // Stop all tracks in screen stream
-      screenStreamRef.current.getTracks().forEach((track) => track.stop());
-      screenStreamRef.current = null;
-    }
-    
-    setIsScreenSharing(false);
-    
-    // Restore camera video track
-    if (localStreamRef.current) {
-      const cameraVideoTrack = localStreamRef.current.getVideoTracks()[0];
-      if (cameraVideoTrack) {
-        console.log('Restoring camera track');
-        replaceVideoTrack(cameraVideoTrack);
-        
-        // Update local video display
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = localStreamRef.current;
-        }
-      } else {
-        console.warn('No camera track available to restore');
-      }
-    }
-  }, [replaceVideoTrack]);
+  }, [
+    replaceVideoTrackOnAllPeers,
+    renegotiateAllPeers,
+    scheduleScreenShareRetries,
+    send,
+    stopScreenShare,
+    updateLocalPreview,
+  ]);
 
   // Start recording - full meeting composite (all participants in one frame)
   const startRecording = useCallback(async () => {
@@ -1162,6 +1498,9 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
       return;
     }
     try {
+      const recordingStartedAt = new Date();
+      recordingStartedAtRef.current = recordingStartedAt;
+
       const getParticipants = () => {
         const remotes = remoteStreamsRef.current;
         const names = peerNamesRef.current;
@@ -1177,7 +1516,13 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
         }));
         return [local, ...remoteList];
       };
-      const { stream: compositeStream, cleanup } = await createMeetingCompositeStream(getParticipants);
+      const { stream: compositeStream, cleanup } = await createMeetingCompositeStream(
+        getParticipants,
+        {
+          roomName: roomDisplayName || "Meeting",
+          startedAt: recordingStartedAt,
+        }
+      );
       compositeCleanupRef.current = cleanup;
 
       if (compositeStream.getTracks().length === 0) {
@@ -1205,15 +1550,19 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
         const blob = new Blob(recordingChunksRef.current, { type: mimeType });
         setRecordingStatus("uploading");
         try {
+          const recordedAt = recordingStartedAtRef.current ?? new Date();
           const formData = new FormData();
-          const now = new Date();
-          const pad = (n: number) => String(n).padStart(2, "0");
-          const dateTime =
-            `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-` +
-            `${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
-          const filename = `recorded-meeting-${uuid}-${dateTime}.webm`;
+          const filename = buildRecordingFilename({
+            roomId: uuid,
+            roomName: roomDisplayName,
+            date: recordedAt,
+            ext: "webm",
+          });
           formData.append("file", blob, filename);
           formData.append("roomId", uuid);
+          formData.append("sessionToken", sessionToken || "");
+          formData.append("roomName", roomDisplayName || "Meeting");
+          formData.append("recordedAt", recordedAt.toISOString());
           const res = await fetch("/api/recordings", {
             method: "POST",
             body: formData,
@@ -1221,13 +1570,19 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
           if (!res.ok) throw new Error("Upload failed");
           const data = await res.json();
           setRecordingStatus("saved");
+          setRecordingSavedLabel(
+            typeof data.recordedAtDisplay === "string" ? data.recordedAtDisplay : null
+          );
           setIsRecording(false);
-          setTimeout(() => setRecordingStatus("idle"), 3000);
+          setTimeout(() => {
+            setRecordingStatus("idle");
+            setRecordingSavedLabel(null);
+          }, 4000);
           const a = document.createElement("a");
-          if (data.compressed && data.url) {
-            const blobRes = await fetch(data.url);
-            const compressedBlob = await blobRes.blob();
-            a.href = URL.createObjectURL(compressedBlob);
+          if (data.downloadUrl) {
+            const blobRes = await fetch(data.downloadUrl);
+            const fileBlob = await blobRes.blob();
+            a.href = URL.createObjectURL(fileBlob);
           } else {
             a.href = URL.createObjectURL(blob);
           }
@@ -1238,14 +1593,16 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
           console.error("Upload error:", err);
           setRecordingStatus("error");
           setIsRecording(false);
+          const recordedAt = recordingStartedAtRef.current ?? new Date();
+          const fallbackName = buildRecordingFilename({
+            roomId: uuid,
+            roomName: roomDisplayName,
+            date: recordedAt,
+            ext: "webm",
+          });
           const a = document.createElement("a");
           a.href = URL.createObjectURL(blob);
-          const now = new Date();
-          const pad = (n: number) => String(n).padStart(2, "0");
-          const dateTime =
-            `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-` +
-            `${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
-          a.download = `recorded-meeting-${dateTime}.webm`;
+          a.download = fallbackName;
           a.click();
           URL.revokeObjectURL(a.href);
           setTimeout(() => setRecordingStatus("idle"), 3000);
@@ -1263,7 +1620,7 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
       compositeCleanupRef.current = null;
       alert("Failed to start recording.");
     }
-  }, [uuid, isScreenSharing, remoteStreams, peerNames, userName, send]);
+  }, [uuid, roomDisplayName, sessionToken, isScreenSharing, remoteStreams, peerNames, userName, send]);
 
   // Stop recording
   const stopRecording = useCallback(() => {
@@ -1285,24 +1642,72 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
     };
   }, []);
 
+  const renderReactions = (peerId: string) =>
+    (peerReactions[peerId] || []).map((r) => (
+      <span key={r.id} className="video-tile-reaction" aria-hidden>
+        {r.emoji}
+      </span>
+    ));
+
   if (authState === "loading") {
     return (
-      <div className="loading-wrap room-auth-loading">
-        <p>Checking room…</p>
+      <div className="landing">
+        <PageBackground />
+        <header className="landing-nav">
+          <Link href="/" className="landing-brand">
+            <span className="landing-brand-icon" aria-hidden>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+              </svg>
+            </span>
+            NexusRTC
+          </Link>
+        </header>
+        <main className="create-room-main">
+          <LoadingSpinner label="Connecting to room…" />
+        </main>
       </div>
     );
   }
 
   if (authState === "notfound") {
     return (
-      <div className="app-wrap">
-        <div className="notif notif-danger room-not-found">
-          <h2>Room not found</h2>
-          <p>This room does not exist or was never created. Ask the host for a new link.</p>
-          <Link href="/room/create" className="btn btn-primary btn-sm">
-            Create a room
+      <div className="landing">
+        <PageBackground />
+        <header className="landing-nav">
+          <Link href="/" className="landing-brand">
+            <span className="landing-brand-icon" aria-hidden>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+              </svg>
+            </span>
+            NexusRTC
           </Link>
-        </div>
+          <ThemeToggle />
+        </header>
+        <main className="create-room-main">
+          <div className="status-card">
+            <div className="status-card-icon status-card-icon--danger" aria-hidden>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                <line x1="12" y1="9" x2="12" y2="13" />
+                <line x1="12" y1="17" x2="12.01" y2="17" />
+              </svg>
+            </div>
+            <h1 className="status-card-title">Room not found</h1>
+            <p className="status-card-text">
+              This room doesn&apos;t exist or the server was restarted. Ask the host for a new link.
+            </p>
+            <div className="status-card-actions">
+              <Link href="/room/create" className="btn btn-primary">
+                Create a room
+              </Link>
+              <Link href="/" className="btn btn-ghost">
+                Go home
+              </Link>
+            </div>
+          </div>
+        </main>
       </div>
     );
   }
@@ -1354,6 +1759,20 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
             <span className="viewer-badge-dot" />
             {viewerCount} in call
           </span>
+          {isHostJoin && (
+            <button
+              type="button"
+              className={`waiting-room-toggle ${waitingRoomEnabled ? "is-on" : ""}`}
+              onClick={toggleWaitingRoom}
+              title={waitingRoomEnabled ? "Waiting room on — guests need approval" : "Waiting room off — guests join directly"}
+              aria-pressed={waitingRoomEnabled}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+              </svg>
+              <span>{waitingRoomEnabled ? "Lobby on" : "Lobby off"}</span>
+            </button>
+          )}
         </div>
         <div className="room-nav-actions">
           <CopyLinkButton roomLink={roomLink} copy={copy} />
@@ -1364,9 +1783,67 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
         </div>
       </header>
 
-      <Chat wsUrl={chatWsUrl} />
+      <Chat socket={roomSocket} chatKey={chatKey} encrypted={!!chatKey} />
+
+      {isHostJoin && waitingRoomEnabled && waitingGuests.length > 0 && (
+        <aside className="waiting-room-panel" role="region" aria-label="Waiting room">
+          <div className="waiting-room-panel-head">
+            <h3>Waiting to join ({waitingGuests.length})</h3>
+            <button type="button" className="btn btn-primary btn-sm" onClick={admitAllGuests}>
+              Admit all
+            </button>
+          </div>
+          <ul className="waiting-room-list">
+            {waitingGuests.map((guest) => (
+              <li key={guest.id} className="waiting-room-item">
+                <span>{guest.name}</span>
+                <div className="waiting-room-actions">
+                  <button type="button" className="btn btn-primary btn-sm" onClick={() => admitGuest(guest.id)}>
+                    Admit
+                  </button>
+                  <button type="button" className="btn btn-ghost btn-sm" onClick={() => rejectGuest(guest.id)}>
+                    Deny
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </aside>
+      )}
 
       <main className="room-main">
+      {inWaitingRoom && (
+        <div className="waiting-room-overlay">
+          <div className="status-card">
+            <h2 className="status-card-title">Waiting for host</h2>
+            <p className="status-card-text">The host will let you in shortly…</p>
+            <LoadingSpinner label="In waiting room" />
+          </div>
+        </div>
+      )}
+
+      {roomRejected && (
+        <div className="room-main-center">
+          <div className="status-card">
+            <h2 className="status-card-title">Entry denied</h2>
+            <p className="status-card-text">The host declined your request to join.</p>
+            <Link href="/" className="btn btn-primary">Go home</Link>
+          </div>
+        </div>
+      )}
+
+      {roomFull && (
+        <div className="room-main-center">
+          <div className="status-card">
+            <h2 className="status-card-title">Room is full</h2>
+            <p className="status-card-text">This meeting has reached the maximum number of participants.</p>
+            <Link href="/" className="btn btn-primary">Go home</Link>
+          </div>
+        </div>
+      )}
+
+      {!inWaitingRoom && !roomRejected && !roomFull && (
+        <>
       {recordingPeer && !isRecording && (
         <div className="recording-by-peer-banner">
           <span className="recording-dot" />
@@ -1398,17 +1875,33 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
               const stream = remoteStreams[primaryPeerId];
               if (!stream?.getTracks().length) return null;
               const handUp = !!raisedHands[primaryPeerId];
+              const sharingScreen = !!remoteScreenShare[primaryPeerId];
               const peerName = peerNames[primaryPeerId] || `Peer ${primaryPeerId.slice(0, 4)}`;
+              const videoKey = `${primaryPeerId}-${remoteVideoEpoch[primaryPeerId] ?? 0}-${remoteVideoTrackId(stream)}`;
               return (
-                <div key={primaryPeerId} className={`video-tile video-tile--primary ${handUp ? "video-tile--hand-raised" : ""}`}>
-                  <RemoteVideo stream={stream} />
+                <div
+                  key={primaryPeerId}
+                  className={`video-tile video-tile--primary ${handUp ? "video-tile--hand-raised" : ""} ${sharingScreen ? "video-tile--screen-share" : ""}`}
+                >
+                  <RemoteVideo
+                    key={videoKey}
+                    stream={stream}
+                    isScreenShare={sharingScreen}
+                    onVideoTrackChange={() => bumpRemoteVideo(primaryPeerId)}
+                  />
                   {handUp && <span className="video-tile-hand" title="Hand raised">✋</span>}
                   <span className="video-tile-label">{peerName}</span>
+                  {sharingScreen && (
+                    <div className="screen-share-indicator">
+                      <span>Sharing Screen</span>
+                    </div>
+                  )}
+                  {renderReactions(primaryPeerId)}
                 </div>
               );
             })()}
-            <div className={`video-tile you ${useFocusLayout && !primaryPeerId ? "video-tile--primary" : ""} ${localHandUp ? "video-tile--hand-raised" : ""}`}>
-              <video ref={localVideoRef} className={isScreenSharing ? '' : 'mirror'} autoPlay muted playsInline style={{ opacity: isVideoEnabled || isScreenSharing ? 1 : 0.3 }} />
+            <div className={`video-tile you ${useFocusLayout && !primaryPeerId ? "video-tile--primary" : ""} ${localHandUp ? "video-tile--hand-raised" : ""} ${isScreenSharing ? "video-tile--screen-share" : ""}`}>
+              <video ref={localVideoRef} className={isScreenSharing ? "video-screen-share" : "mirror"} autoPlay muted playsInline style={{ opacity: isVideoEnabled || isScreenSharing ? 1 : 0.3 }} />
               {!isVideoEnabled && (
                 <div className="video-placeholder">
                   <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -1426,16 +1919,32 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
                   <span>Sharing Screen</span>
                 </div>
               )}
+              {myPeerId && renderReactions(myPeerId)}
               {isRecording && (
                 <div className="recording-indicator">
                   <span className="recording-dot" />
-                  <span>{recordingStatus === "uploading" ? "Saving…" : recordingStatus === "saved" ? "Saved!" : "Recording"}</span>
+                  <span>
+                    {recordingStatus === "uploading"
+                      ? "Saving…"
+                      : recordingStatus === "saved"
+                        ? recordingSavedLabel
+                          ? `Saved · ${recordingSavedLabel}`
+                          : "Saved!"
+                        : recordingStatus === "error"
+                          ? "Save failed"
+                          : "Recording"}
+                  </span>
                 </div>
               )}
             </div>
-            {connClosed && (
+            {reconnecting && (
+              <div className="room-alert room-alert-warning" role="status">
+                Reconnecting…
+              </div>
+            )}
+            {connFailed && (
               <div className="room-alert room-alert-danger">
-                Connection closed. Please refresh the page.
+                Connection lost. Refresh the page to rejoin.
               </div>
             )}
             {orderedRemoteIds
@@ -1444,17 +1953,33 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
                 const stream = remoteStreams[peerId];
                 if (!stream?.getTracks().length) return null;
                 const handUp = !!raisedHands[peerId];
+                const sharingScreen = !!remoteScreenShare[peerId];
                 const peerName = peerNames[peerId] || `Peer ${peerId.slice(0, 4)}`;
+                const videoKey = `${peerId}-${remoteVideoEpoch[peerId] ?? 0}-${remoteVideoTrackId(stream)}`;
                 return (
-                  <div key={peerId} className={`video-tile ${handUp ? "video-tile--hand-raised" : ""}`}>
-                    <RemoteVideo stream={stream} />
+                  <div
+                    key={peerId}
+                    className={`video-tile ${handUp ? "video-tile--hand-raised" : ""} ${sharingScreen ? "video-tile--screen-share" : ""}`}
+                  >
+                    <RemoteVideo
+                      key={videoKey}
+                      stream={stream}
+                      isScreenShare={sharingScreen}
+                      onVideoTrackChange={() => bumpRemoteVideo(peerId)}
+                    />
                     {handUp && <span className="video-tile-hand" title="Hand raised">✋</span>}
                     <span className="video-tile-label">{peerName}</span>
+                    {sharingScreen && (
+                      <div className="screen-share-indicator">
+                        <span>Sharing Screen</span>
+                      </div>
+                    )}
+                    {renderReactions(peerId)}
                   </div>
                 );
               })}
           </div>
-          {!hasPeers && !connClosed && (
+          {!hasPeers && !reconnecting && !connFailed && (
             <aside className="room-empty-panel">
               <div className="room-empty-icon" aria-hidden>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
@@ -1486,7 +2011,10 @@ export function RoomPage({ uuid, roomLink }: { uuid: string; roomLink: string })
           onToggleRecording={isRecording ? stopRecording : startRecording}
           onToggleHandRaise={toggleHandRaise}
           onLayoutChange={handleLayoutChange}
+          onSendReaction={sendReaction}
         />
+      )}
+        </>
       )}
       </main>
     </div>

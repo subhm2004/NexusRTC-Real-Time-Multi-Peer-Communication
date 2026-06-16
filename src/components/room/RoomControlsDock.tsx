@@ -25,6 +25,7 @@ type RoomControlsDockProps = {
   onToggleRecording: () => void;
   onToggleHandRaise: () => void;
   onLayoutChange: (layout: VideoLayoutMode) => void;
+  onSendReaction?: (emoji: string) => void;
 };
 
 function CtrlIcon({ children }: { children: React.ReactNode }) {
@@ -45,18 +46,22 @@ export function RoomControlsDock({
   onToggleRecording,
   onToggleHandRaise,
   onLayoutChange,
+  onSendReaction,
 }: RoomControlsDockProps) {
   const [layoutOpen, setLayoutOpen] = useState(false);
+  const [reactionOpen, setReactionOpen] = useState(false);
   const layoutRef = useRef<HTMLDivElement>(null);
+  const reactionRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!layoutOpen) return;
+    if (!layoutOpen && !reactionOpen) return;
     const onDoc = (e: MouseEvent) => {
-      if (!layoutRef.current?.contains(e.target as Node)) setLayoutOpen(false);
+      if (layoutOpen && !layoutRef.current?.contains(e.target as Node)) setLayoutOpen(false);
+      if (reactionOpen && !reactionRef.current?.contains(e.target as Node)) setReactionOpen(false);
     };
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
-  }, [layoutOpen]);
+  }, [layoutOpen, reactionOpen]);
 
   return (
     <div className="room-controls-dock">
@@ -170,6 +175,41 @@ export function RoomControlsDock({
           </CtrlIcon>
           <span className="room-ctrl-label">{isHandRaised ? "Lower" : "Hand"}</span>
         </button>
+
+        {onSendReaction && (
+          <div ref={reactionRef} className="room-reaction-picker">
+            <button
+              type="button"
+              className={`room-ctrl-btn room-ctrl-btn--round ${reactionOpen ? "is-active" : ""}`}
+              onClick={() => setReactionOpen((o) => !o)}
+              title="Send reaction"
+              aria-label="Send reaction"
+              aria-expanded={reactionOpen}
+            >
+              <CtrlIcon>
+                <span style={{ fontSize: "1.1rem", lineHeight: 1 }}>👍</span>
+              </CtrlIcon>
+              <span className="room-ctrl-label">React</span>
+            </button>
+            {reactionOpen && (
+              <div className="room-reaction-menu" role="menu">
+                {["👍", "❤️", "😂", "👏", "🔥"].map((emoji) => (
+                  <button
+                    key={emoji}
+                    type="button"
+                    className="room-reaction-item"
+                    onClick={() => {
+                      onSendReaction(emoji);
+                      setReactionOpen(false);
+                    }}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         <div ref={layoutRef} className="room-layout-picker">
           <button

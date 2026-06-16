@@ -4,9 +4,11 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { PageBackground } from "@/components/ui/PageBackground";
 import {
   CREATOR_TOKEN_PREFIX,
   SESSION_TOKEN_PREFIX,
+  setStoredRoomPassword,
 } from "@/lib/room-auth";
 
 const MIN_PASSWORD = 4;
@@ -64,6 +66,7 @@ export default function CreateRoomPage() {
 
       sessionStorage.setItem(`${CREATOR_TOKEN_PREFIX}${data.roomId}`, data.creatorToken);
       sessionStorage.setItem(`${SESSION_TOKEN_PREFIX}${data.roomId}`, data.sessionToken);
+      setStoredRoomPassword(data.roomId, trimmed);
       router.push(`/room/${data.roomId}`);
     } catch {
       setError("Network error. Please try again.");
@@ -74,6 +77,7 @@ export default function CreateRoomPage() {
 
   return (
     <div className="landing">
+      <PageBackground />
       <header className="landing-nav">
         <Link href="/" className="landing-brand">
           <span className="landing-brand-icon" aria-hidden>
@@ -88,6 +92,11 @@ export default function CreateRoomPage() {
 
       <main className="create-room-main">
         <div className="name-modal name-modal-room create-room-card">
+          <div className="create-room-progress" aria-hidden>
+            <span className={`create-room-progress-step ${step >= 1 ? "active" : ""}`} />
+            <span className={`create-room-progress-step ${step >= 2 ? "active" : step > 2 ? "done" : ""}`} />
+            <span className="create-room-progress-step" />
+          </div>
           <div className="create-room-steps" aria-hidden>
             <span className={step === 1 ? "create-step active" : "create-step done"}>1. Room name</span>
             <span className={step === 2 ? "create-step active" : "create-step"}>2. Password</span>
